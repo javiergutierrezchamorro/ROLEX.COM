@@ -5,31 +5,42 @@
  * C para Open Watcom v2 (16 bits, modelo tiny, salida .COM).  Todo el
  * programa cabe en UN fichero, ROLEX.COM: la imagen del reloj (caja,
  * bisel, brazalete Y esfera fotograficos) viaja DENTRO del ejecutable,
- * comprimida con el RLE del PCX, junto con su paleta de 256 colores.
+ * comprimida con un RLE sencillo, junto con su paleta de 256 colores.
  *
- * La esfera es la FOTO REAL (esfera2.jpg): corona, ROLEX, OYSTER
- * PERPETUAL DATEJUST, minuteria CON sus numerales, bastones de acero,
- * ventana de fecha y textos de certificacion; nada se sintetiza con
- * fuentes ni con geometria.  prep_img.py la reduce, le da contraste y
- * la reindexa contra la paleta (sin dithering, indice exacto).
+ * La esfera no se sintetiza con fuentes: prep_img.py reduce la esfera
+ * REAL (esfera2.jpg) y la pega sobre la foto de la caja (reloj2.png).
+ * Todo va en escala de grises (indices 0..249, rampa de 250 niveles)
+ * y la reduccion es por PROMEDIO DE AREA: los textos (corona, ROLEX,
+ * OYSTER PERPETUAL, DATEJUST, SUPERLATIVE CHRONOMETER, SWISS MADE) y los
+ * numeros de la pista de minutos salen como un gris proporcional al
+ * grosor del trazo.  Antes se umbralizaban a tinta pura y los numeros
+ * de minutos desaparecian.  Los indices 250..255 son los colores que
+ * usa este programa para las agujas.
  *
  * Optimizacion (objetivo 8086, -0):
- *   - No se redibuja NADA si los tres angulos no cambian: el bucle
- *     solo trabaja cuando el contador de tics del BIOS avanza (18,2
- *     veces/s) y los angulos solo se mueven ~4,3 veces/s: esas son
- *     las unicas actualizaciones (antes: fotograma completo a 70 Hz).
- *   - Redibujado PARCIAL por cajas: cada aguja recuerda el rectangulo
- *     que toco; al actualizar se restaura el fondo solo en la caja
- *     vieja, se dibuja la aguja nueva y se vuela a VRAM solo la union
- *     de cajas vieja/nueva (el segundero suele tocar 2-4 kB, no 29 kB
- *     de ida y otro tanto de vuelta como el volcado completo).
- *   - Fuera multiplicaciones y divisiones de los caminos calientes:
- *     filas por desplazamientos (170 = 128+32+8+2, 320 = 256+64),
- *     relleno de poligonos DDA (una division por arista), disco con
- *     raiz cuadrada incremental y proporciones de aguja por sumas.
- *   - Bloques con memset/memcpy: fondo RLE por tiras, restauraciones
- *     y volcados por fila con _fmemcpy (rep movsw), esfera en UN
- *     bloque de 28.900 bytes.
+ *   - SOLO SE REDIBUJA CUANDO CAMBIA UN ANGULO.  El angulo va en 1/256
+ *     de vuelta y sale de los tics del BIOS (18.2 por segundo): el
+ *     segundero cambia unas 4 veces por segundo y las otras agujas casi
+ *     nunca.  El resto del tiempo el bucle solo mira tics y teclado.
+ *   - Fuera multiplicaciones y divisiones de los caminos calientes
+ *     (los bucles por pixel y por fila): las filas se calculan con
+ *     desplazamientos (170 = 128+32+8+2, 320 = 256+64), las aristas de
+ *     los poligonos se recorren con error de Bresenham (solo sumas y
+ *     comparaciones), el disco y la fecha usan sumas y restas, y las
+ *     proporciones de las agujas salen de sumas de desplazamientos
+ *     (exactas para hw <= 5).  Quedan, solo al redibujar, los productos
+ *     seno*radio de los vertices (en int de 16 bits) y las cinco
+ *     divisiones de la conversion de hora, que se evaluan unicamente
+ *     cuando cambia el tic y no son potencias de dos.
+ *   - FRANJAS SUCIAS: cada primitiva anota, por fila, el tramo de x que
+ *     ha pintado.  Para el fotograma siguiente solo se borran del marco
+ *     (copiando de la esfera limpia) los tramos que pintaron las agujas
+ *     anteriores, y a la VRAM solo se vuelcan los tramos de las agujas
+ *     viejas y nuevas: unos pocos KB en vez de copiar 2 x 28.900 bytes.
+ *     Los tramos se ensanchan a palabras (x par..x impar) y DIAL_X es
+ *     PAR, asi que todas las copias son rep movsw alineados (8086/286).
+ *   - Bloques con memset/memcpy siempre que se puede: el fondo RLE se
+ *     decodifica por tiras y la ventana de la fecha se borra por filas.
  *
  * Al arrancar:
  *   - PALETA (768 bytes) -> DAC (puertos 3C8h/3C9h), valores /4.
@@ -40,85 +51,43 @@
  *     trabajo:
  *        bloque:00000  marco de trabajo  (fotograma compuesto, 28.900 B)
  *        bloque:28900  esfera limpia     (copia del fondo,    28.900 B)
+ *     (Las primeras versiones usaban la pagina B000 como doble bufer:
+ *     en modo 13h el BIOS no la mapea y sale blanca.  En RAM va bien.)
  *   - La ventanita de la fecha se "cocina" UNA VEZ en la esfera limpia
  *     (interior blanco + dia del mes, sin cero inicial); a medianoche
- *     se vuelve a cocinar con el dia nuevo.
+ *     se vuelve a cocinar con el dia nuevo (y se marca toda la esfera
+ *     como sucia para que el marco y la VRAM la recojan entera).  El
+ *     fotograma es solo: borrar agujas viejas -> agujas -> volcar.
  *
- * ANTI-PARPADEO: el fotograma se compone entero en RAM y se vuela a
- * la VRAM; en pantalla nunca hay estado intermedio de una aguja.
+ * ANTI-PARPADEO: el fotograma se compone en RAM, se espera el retrazo
+ * vertical y SOLO ENTONCES se vuelca a la VRAM; en pantalla nunca hay
+ * estado intermedio.
  *
- * Barrido suave: tics del BIOS en 0040:006C -> segundos con fraccion
- * (tics * 2000 / 36413; 18.2065 tics/s, sin deriva).  Fecha del RTC
- * del CMOS (70h/71h) al arrancar y al cruzar medianoche (reserva int
- * 21h AH=2Ah).  ESC leyendo el buffer del BIOS en 0040:001A.
+ * Hora: tics del BIOS en 0040:006C -> segundos con fraccion
+ * (tics * 2000 / 36413; 18.2065 tics/s, sin deriva).  Fecha del DOS
+ * (int 21h AH=2Ah) al arrancar y al cruzar medianoche.  ESC leyendo el
+ * buffer del BIOS en 0040:001A.
  * Aritmetica entera: tabla de senos Q8.  El angulo va en 1/256 de
  * vuelta (0 = las 12, horario).
  *
  * Compilar (Open Watcom v2, 16 bits, DOS):
- *      wcl -mt -0 -bt=dos -os -d0 ROLEX.C     -> ROLEX.COM
- *      wcl -mt -0 -bt=dos -os -d0 -l=dos ROLEX.C -> ROLEX.EXE
+ *      wcl -mt -0 -bt=dos -os -oe -d0 ROLEX.C     -> ROLEX.COM
+ *      wcl -mt -0 -bt=dos -os -oe -d0 -l=dos ROLEX.C -> ROLEX.EXE
+ * (-oe permite expandir en linea las funciones __inline, como pixel)
  *
- * Regenerar la imagen desde la foto (esfera2.jpg):
- *      python3 verificacion/prep_img.py
- *
- * Verificacion en un PC moderno: scripts/host_main.c incluye este
- * fichero con ROLEX_HOST definido, simula la VRAM, los puertos y la
- * int 21h, comprueba que el redibujado parcial da EXACTAMENTE el mismo
- * fotograma que la composicion completa y vuelca el resultado a PPM.
- * El codigo DOS no cambia.
+ * Regenerar la imagen desde las fotos (reloj2.png, esfera2.jpg):
+ *      python3 prep_img.py reloj2.png esfera2.jpg IMGRLE.H
  */
 
-#ifdef ROLEX_HOST
-/* ------------------------------------------------------------------
-   Arnés de verificacion en anfitrion moderno (gcc): RAM simulada de
-   1 MB + puertos falsos.  La imagen viaja incrustada (IMGRLE.H).
-   ------------------------------------------------------------------ */
-#include <stdio.h>
-#include <stdlib.h>
-#include <string.h>
-#include <stddef.h>
-
-#define far
-extern unsigned char emu[0x110000];
-extern void *rolex_host_ptr;      /* ultimo puntero pasado a FP_OFF */
-#define MK_FP(seg, off) ((void *)(emu + ((unsigned long)(seg) << 4) + (unsigned long)(off)))
-#define _fmemcpy memcpy
-#define _fmemset memset
-
-union REGS {
-    struct { unsigned char al, ah, bl, bh, cl, ch, dl, dh; } h;
-    struct { unsigned short ax, bx, cx, dx, si, di, cflag, flags; } x;
-    struct { unsigned long ax, bx, cx, dx, si, di, cflag, flags; } w;
-};
-struct SREGS {
-    unsigned int es, cs, ss, ds;
-};
-
-#define FP_OFF(p) (rolex_host_ptr = (void *)(size_t)(p), \
-                   (unsigned)(size_t)(p) & 0xFFFFu)
-#define FP_SEG(p) (0)
-#define segread(s) ((void)(s))
-
-unsigned char inp(unsigned puerto);
-void outp(unsigned puerto, unsigned char valor);
-int int86(int num, union REGS *entrada, union REGS *salida);
-int int86x(int num, union REGS *entrada, union REGS *salida,
-           struct SREGS *segs);
-
-#else
-/* ------------------------------------------------------------------
-   Programa DOS real (Open Watcom, 16 bits, modelo tiny)
-   ------------------------------------------------------------------ */
 #include <dos.h>     /* MK_FP, union REGS, SREGS, int86x, FP_OFF */
 #include <conio.h>   /* inp, outp                         */
 #include <string.h>  /* memcpy, memset, _fmemcpy, _fmemset */
-#endif
 
 /* ==================== imagen incrustada ==================== */
 
-/* IMGRLE.H lo genera prep_img.py desde la FOTO (esfera2.jpg):
-   geometria calibrada (DIAL_*, STRIP_*, VEN_* y agujas), la paleta
-   PALETA[768] y el fondo FONDO_RLE[] (RLE estilo PCX). */
+/* IMGRLE.H lo genera prep_img.py desde las FOTOS (esfera2.jpg y
+   reloj2.png): geometria calibrada (DIAL_*, STRIP_*, VEN_* y agujas),
+   la paleta PALETA[768] y el fondo FONDO_RLE[] (RLE propio). */
 #include "IMGRLE.H"
 
 /* ============================ constantes ============================ */
@@ -147,9 +116,8 @@ static unsigned char far *ESFERA;  /* esfera limpia (base)         */
    (cuando se cocina la fecha, una vez por dia) */
 static unsigned char far *lienzo;
 
-/* indices fijos de la paleta (247..249 trae prep_img.py para los
-   dorados de la foto, si los hay; 250..255 son para lo que dibuja
-   este programa) */
+/* indices fijos de la paleta (0..249 es la rampa de grises de la foto;
+   250..255 los fija prep_img.py para lo que dibuja este programa) */
 #define C_OSC 250           /* acero oscuro (bordes de las agujas)   */
 #define C_CLA 252           /* acero claro (cuerpo)                   */
 #define C_HI  253           /* acero brillo (faceta central)          */
@@ -171,7 +139,7 @@ static const int SEN[65] = {
     251,  252,  253,  254,  255,  255,  256,  256,  256
 };
 
-/* Digitos 7x7 para la fecha.  Bit 0x80 = pixel izquierdo. */
+/* Digitos 7x8 para la fecha.  Bit 0x80 = pixel izquierdo. */
 static const unsigned char FUENTE[10][7] = {
     { 0x7C, 0xC6, 0xCE, 0xD6, 0xE6, 0xC6, 0x7C },  /* 0 */
     { 0x18, 0x38, 0x18, 0x18, 0x18, 0x18, 0x7E },  /* 1 */
@@ -191,33 +159,42 @@ static const unsigned char FUENTE[10][7] = {
 static int cruce_min[DIAL_H];
 static int cruce_max[DIAL_H];
 
-/* caja del elemento que se esta dibujando: poligono, disco y linea la
-   engordan; dibuja_agujas() la guarda por aguja (redibujado parcial) */
-static int ax0, ay0, ax1, ay1;
-
-static void marca_reset(void)
-{
-    ax0 = DIAL_W; ay0 = DIAL_H; ax1 = -1; ay1 = -1;
-}
-
-static void marca(int x0, int y0, int x1, int y1)
-{
-    if (x0 < 0) x0 = 0;
-    if (y0 < 0) y0 = 0;
-    if (x1 > DIAL_W - 1) x1 = DIAL_W - 1;
-    if (y1 > DIAL_H - 1) y1 = DIAL_H - 1;
-    if (x0 < ax0) ax0 = x0;
-    if (y0 < ay0) ay0 = y0;
-    if (x1 > ax1) ax1 = x1;
-    if (y1 > ay1) ay1 = y1;
-}
-
 /* ==================== primitivas de dibujo ==================== */
 
-static void pixel(int x, int y, unsigned char c)
+/* franjas sucias: [x min, x max] pintado en cada fila por las
+   primitivas, en dos juegos (fotograma actual y anterior; act es el del
+   ultimo fotograma compuesto).  Vacio = min muy positivo y max muy
+   negativo (0x7F / 0x80 por bloque, como las tablas de cruces).
+   cmin/cmax apuntan al juego en el que se anota. */
+static int suc_min[2][DIAL_H];
+static int suc_max[2][DIAL_H];
+static int act;
+static int *cmin = suc_min[0];
+static int *cmax = suc_max[0];
+
+static __inline void sucia(int x1, int x2, int y)
 {
-    if ((unsigned)x < DIAL_W && (unsigned)y < DIAL_H)
+    if (x1 < cmin[y]) cmin[y] = x1;
+    if (x2 > cmax[y]) cmax[y] = x2;
+}
+
+/* toda la esfera sucia: tras cocinar la fecha, para que el marco y la
+   VRAM recojan la esfera entera en el siguiente fotograma */
+static void sucio_todo(void)
+{
+    int y;
+    for (y = 0; y < DIAL_H; y++) {
+        suc_min[act][y] = 0;
+        suc_max[act][y] = DIAL_W - 1;
+    }
+}
+
+static __inline void pixel(int x, int y, unsigned char c)
+{
+    if ((unsigned)x < DIAL_W && (unsigned)y < DIAL_H) {
         lienzo[OFF170(y) + (unsigned)x] = c;
+        sucia(x, x, y);
+    }
 }
 
 static void linea_h(int x1, int x2, int y, unsigned char c)
@@ -228,15 +205,16 @@ static void linea_h(int x1, int x2, int y, unsigned char c)
     if (x1 < 0) x1 = 0;
     if (x2 >= DIAL_W) x2 = DIAL_W - 1;
     if (x1 > x2) return;
+    sucia(x1, x2, y);
     /* bloque horizontal: memset en vez de bucle de pixeles */
     _fmemset(lienzo + OFF170(y) + (unsigned)x1, c,
              (unsigned)(x2 - x1 + 1));
 }
 
 /* poligono convexo relleno por barrido de scanlines, recortado al
-   dial.  DDA: UNA division por arista al empezar y despues puro
-   incremento por fila (nada de multiplicar/dividir dentro del
-   bucle).  Los cruces de cada fila se apuntan en las tablas, que se
+   dial.  Cada arista se recorre SIN dividir: error de Bresenham por
+   filas (suma y comparacion; x avanza los pixeles que pida la
+   pendiente).  Los cruces de cada fila se apuntan en las tablas, que se
    reponen con memset y se pintan al final con linea_h (memset). */
 static void poligono(int n, const int *xs, const int *ys, unsigned char c)
 {
@@ -245,7 +223,6 @@ static void poligono(int n, const int *xs, const int *ys, unsigned char c)
     for (i = 0; i < n; i++) {
         if (ys[i] < ymin) ymin = ys[i];
         if (ys[i] > ymax) ymax = ys[i];
-        marca(xs[i], ys[i], xs[i], ys[i]);   /* caja del elemento */
     }
     if (ymin < 0) ymin = 0;
     if (ymax > DIAL_H - 1) ymax = DIAL_H - 1;
@@ -259,21 +236,21 @@ static void poligono(int n, const int *xs, const int *ys, unsigned char c)
 
     for (i = 0; i < n; i++) {
         int j = (i + 1 == n) ? 0 : i + 1;
-        int ya = ys[i], yb = ys[j];
-        long acc, paso;               /* DDA en Q8 */
-        int y0, yfin;
+        int x, dx, dy, sx = 1, err = 0, yfin;
 
-        if (ya == yb) continue;
-        paso = ((long)(xs[j] - xs[i]) << 8) / (yb - ya);
-        if (ya < yb) { acc = (long)xs[i] << 8; y0 = ya; yfin = yb; }
-        else         { acc = (long)xs[j] << 8; y0 = yb; yfin = ya; }
-        if (y0 < ymin) { acc += paso * (long)(ymin - y0); y0 = ymin; }
+        if (ys[i] == ys[j]) continue;
+        if (ys[i] < ys[j]) { x = xs[i]; y = ys[i]; dx = xs[j] - x; dy = ys[j] - y; }
+        else               { x = xs[j]; y = ys[j]; dx = xs[i] - x; dy = ys[i] - y; }
+        if (dx < 0) { sx = -1; dx = -dx; }
+        yfin = y + dy;
         if (yfin > ymax + 1) yfin = ymax + 1;
-        for (y = y0; y < yfin; y++) {
-            int x = (int)(acc >> 8);
-            if (x < cruce_min[y]) cruce_min[y] = x;
-            if (x > cruce_max[y]) cruce_max[y] = x;
-            acc += paso;
+        for (; y < yfin; y++) {
+            if (y >= ymin) {
+                if (x < cruce_min[y]) cruce_min[y] = x;
+                if (x > cruce_max[y]) cruce_max[y] = x;
+            }
+            err += dx;
+            while (err >= dy) { err -= dy; x += sx; }
         }
     }
     for (y = ymin; y <= ymax; y++)
@@ -283,15 +260,17 @@ static void poligono(int n, const int *xs, const int *ys, unsigned char c)
 
 /* disco solido (contrapeso del segundero y remache central): radio
    incremental, raiz cuadrada incremental y cada fila de UNA vez con
-   linea_h (memset), sin bucles de pixeles.  Radio pequeno: el
-   producto r*r directo es mas barato que cualquier truco. */
+   linea_h (memset), sin bucles de pixeles */
 static void disco(int cx, int cy, int r, unsigned char c)
 {
     int dy, dy2 = 0;        /* dy*dy, incremental */
-    int r2 = r * r;
-    int h = r, h2 = r2;     /* semiancho de fila y su cuadrado */
+    int r2 = 0, k;
+    int h = r, h2;          /* semiancho de fila y su cuadrado */
 
-    marca(cx - r, cy - r, cx + r, cy + r);
+    for (k = 1; k <= r; k++)        /* r*r = suma de los r primeros impares */
+        r2 += (k << 1) - 1;
+    h2 = r2;
+
     for (dy = 0; dy <= r; dy++) {
         int limite = r2 - dy2;      /* queda r*r - dy*dy */
         while (h2 > limite) {       /* baja h hasta h*h <= limite */
@@ -316,22 +295,25 @@ static int sen256(unsigned a)
     return -SEN[64u - i];
 }
 
-/* punto del dial: rr a lo largo de la aguja (negativo = cola),
-   k perpendicular.  La Y de la pantalla crece hacia abajo, de ahi el
-   signo menos del coseno: sin el, las agujas girarian al reves. */
-static void punto(unsigned ang, int rr, int k, int *x, int *y)
+#define cos256(a) sen256(64u - (a))
+
+/* punto del dial: s y c son seno y coseno (Q8) del angulo de la aguja,
+   rr va a lo largo de la aguja (negativo = cola) y k es perpendicular.
+   Todo en int de 16 bits: |s|,|c| <= 256 y dentro del dial |rr|+|k| <
+   128, asi que cada suma queda por debajo de 32768.  La Y de la
+   pantalla crece hacia abajo, de ahi el signo menos del coseno: sin
+   el, las agujas girarian al reves. */
+static void punto(int s, int c, int rr, int k, int *x, int *y)
 {
-    int s = sen256(ang), c = sen256((unsigned)(64u - ang));
-    *x = DCX + (int)(((long)s * rr + (long)c * k) >> 8);
-    *y = DCY + (int)((-(long)c * rr + (long)s * k) >> 8);
+    *x = DCX + ((s * rr + c * k) >> 8);
+    *y = DCY + ((s * k - c * rr) >> 8);
 }
 
-/* linea de Bresenham (eje del segundero) */
+/* linea de Bresenham (segundero) */
 static void linea(int x0, int y0, int x1, int y1, unsigned char c)
 {
     int dx = x1 - x0, dy = y1 - y0;
     int sx, sy, err, e2;
-    marca(x0, y0, x1, y1);          /* antes de mutar x0/y0 */
     if (dx < 0) dx = -dx;
     if (dy < 0) dy = -dy;
     sx = (x0 < x1) ? 1 : -1;
@@ -340,7 +322,7 @@ static void linea(int x0, int y0, int x1, int y1, unsigned char c)
     for (;;) {
         pixel(x0, y0, c);
         if (x0 == x1 && y0 == y1) break;
-        e2 = err * 2;
+        e2 = err << 1;
         if (e2 > -dy) { err -= dy; x0 += sx; }
         if (e2 <  dx) { err += dx; y0 += sy; }
     }
@@ -354,48 +336,39 @@ static void linea(int x0, int y0, int x1, int y1, unsigned char c)
 
 /* baston: aguja hexagonal (punta plana, flancos anchos junto al
    centro, cola estrecha), como las de oro blanco del Datejust */
-static void baston(unsigned ang, int r1, int cola, int hw, unsigned char c)
+static void baston(int s, int c, int r1, int cola, int hw, unsigned char col)
 {
     int rrm = r1 >> 2;               /* donde la aguja es mas ancha */
     int hwt = HWT(hw);               /* semiancho de la cola        */
     int hwtip = HWTIP(hw);           /* semiancho en la punta       */
     int x[6], y[6];
-    punto(ang, r1, -hwtip, &x[0], &y[0]);
-    punto(ang, r1,  hwtip, &x[1], &y[1]);
-    punto(ang, rrm,  hw,   &x[2], &y[2]);
-    punto(ang, -cola,  hwt, &x[3], &y[3]);
-    punto(ang, -cola, -hwt, &x[4], &y[4]);
-    punto(ang, rrm, -hw,   &x[5], &y[5]);
-    poligono(6, x, y, c);
+    punto(s, c, r1, -hwtip, &x[0], &y[0]);
+    punto(s, c, r1,  hwtip, &x[1], &y[1]);
+    punto(s, c, rrm,  hw,   &x[2], &y[2]);
+    punto(s, c, -cola,  hwt, &x[3], &y[3]);
+    punto(s, c, -cola, -hwt, &x[4], &y[4]);
+    punto(s, c, rrm, -hw,   &x[5], &y[5]);
+    poligono(6, x, y, col);
 }
 
 /* baston con cuerpo: contorno oscuro + faceta clara, dos hexagonos */
 static void baston2(unsigned ang, int r1, int cola, int hw)
 {
-    baston(ang, r1, cola, hw, C_OSC);
-    if (hw >= 2) baston(ang, r1, cola, hw - 1, C_HI);
-    if (hw >= 3) baston(ang, r1, cola, hw - 2, C_CLA);
+    int s = sen256(ang), c = cos256(ang);
+    baston(s, c, r1, cola, hw, C_OSC);
+    if (hw >= 2) baston(s, c, r1, cola, hw - 1, C_HI);
+    if (hw >= 3) baston(s, c, r1, cola, hw - 2, C_CLA);
 }
 
-/* segundero: barra fina con eje claro y contrapeso circular */
+/* segundero: una linea fina de cola a punta (la real es un hilo
+   negro de un pixel; sin contrapeso circular) */
 static void segundero(unsigned ang)
 {
-    int s, c;
-    int x[4], y[4], xa, ya, xb, yb;
-    punto(ang,  R_AG_S,  1, &x[0], &y[0]);
-    punto(ang,  R_AG_S, -1, &x[1], &y[1]);
-    punto(ang, -COL_S, -1, &x[2], &y[2]);
-    punto(ang, -COL_S,  1, &x[3], &y[3]);
-    poligono(4, x, y, C_OSC);
-    punto(ang, -COL_S, 0, &xa, &ya);
-    punto(ang,  R_AG_S, 0, &xb, &yb);
-    linea(xa, ya, xb, yb, C_CLA);
-    s = sen256(ang);
-    c = sen256((unsigned)(64u - ang));
-    disco(DCX - (int)(((long)s * PESO_S) >> 8),
-          DCY + (int)(((long)c * PESO_S) >> 8), PESO_RO, C_OSC);
-    disco(DCX - (int)(((long)s * PESO_S) >> 8),
-          DCY + (int)(((long)c * PESO_S) >> 8), PESO_RI, C_CLA);
+    int s = sen256(ang), c = cos256(ang);
+    int xa, ya, xb, yb;
+    punto(s, c, -COL_S, 0, &xa, &ya);
+    punto(s, c,  R_AG_S, 0, &xb, &yb);
+    linea(xa, ya, xb, yb, C_OSC);
 }
 
 /* remache central sobre el eje de las agujas */
@@ -408,15 +381,15 @@ static void centro(void)
 
 /* ==================== fecha cocinada en la esfera ==================== */
 
-/* un digito 7x7 dentro de la ventanita */
+/* un digito 7x8 dentro de la ventanita */
 static void digito(int x, int y, char ch)
 {
     const unsigned char *g = FUENTE[ch - '0'];
     int f, b;
     for (f = 0; f < 7; f++) {
         unsigned char bits = g[f];
-        for (b = 0; b < 7; b++)
-            if (bits & (unsigned char)(0x80 >> b))
+        for (b = 0; b < 8; b++)
+            if (bits & (unsigned char)(0x80 >> b) && x + b <= VEN_X1)
                 pixel(x + b, y + f, C_NEG);
     }
 }
@@ -424,19 +397,23 @@ static void digito(int x, int y, char ch)
 /* dia del mes en la ventanita de las 3 (sin cero inicial: el dia 8 se
    escribe "8", no "08"), centrado en la abertura de IMGRLE.H.  Se
    cocina UNA VEZ sobre la esfera limpia: el fotograma de cada frame
-   la copia y asi no se repinta a cada vuelco.  El interior se borra
-   por filas de UNA vez (memset por bloque). */
+   la copia y asi no se repinta a 70 Hz.  El interior se borra por
+   filas de UNA vez (memset por bloque). */
 static void pinta_fecha(int dia)
 {
-    int ancho = VEN_ANCHO, alto = VEN_ALTO;
+    int ancho = VEN_ANCHO;
+    int alto = VEN_ALTO;
     int yd = VEN_Y0 + ((VEN_ALTO - 7) >> 1);
     unsigned off = OFF170(VEN_Y0) + (unsigned)VEN_X0;
     int y;
 
     /* guarda contra cabeceras editadas a mano: nunca salirse de la
        esfera (el memset cruzaria filas y pisaria el marco) */
-    if (VEN_X0 < 0 || VEN_Y0 < 0 ||
-        VEN_X0 + ancho > DIAL_W || VEN_Y0 + alto > DIAL_H) return;
+    if (VEN_X0 < 0 || VEN_Y0 < 0 || VEN_X0 >= DIAL_W || VEN_Y0 >= DIAL_H)
+        return;
+    if (VEN_X0 + ancho > DIAL_W) ancho = DIAL_W - VEN_X0;
+    if (VEN_Y0 + alto > DIAL_H) alto = DIAL_H - VEN_Y0;
+    if (ancho <= 0 || alto <= 0) return;
 
     lienzo = ESFERA;
     for (y = 0; y < alto; y++) {
@@ -444,12 +421,16 @@ static void pinta_fecha(int dia)
         off += DIAL_W;
     }
     if (dia < 10) {                     /* un digito, centrado */
-        digito(VEN_X0 + ((ancho - 7) >> 1), yd, (char)('0' + dia));
+        digito(VEN_X0 + ((VEN_ANCHO - 7) >> 1), yd, (char)('0' + dia));
     } else {
-        int x0 = VEN_X0 + ((ancho - 13) >> 1);
-        digito(x0,     yd, (char)('0' + (dia / 10) % 10));
-        digito(x0 + 6, yd, (char)('0' + dia % 10));
+        int x0 = VEN_X0 + ((VEN_ANCHO - 13) >> 1);
+        int dec = 0;
+        if (x0 < VEN_X0) x0 = VEN_X0;    /* ventanita estrecha */
+        while (dia >= 10) { dia -= 10; dec++; }   /* dia / 10 y dia % 10 */
+        digito(x0,     yd, (char)('0' + dec));
+        digito(x0 + 6, yd, (char)('0' + dia));
     }
+    sucio_todo();
 }
 
 /* ============================ hardware ============================ */
@@ -498,47 +479,14 @@ static void espera_retrazo(void)
     while ((inp(0x3DA) & 0x08) == 0) ;
 }
 
-static unsigned char cmos_lee(unsigned char reg)
+/* dia del mes del DOS (int 21h AH=2Ah; el DOS ya lo lee del RTC al
+   arrancar y lo adelanta solo al cruzar medianoche) */
+static int lee_fecha(void)
 {
-    outp(0x70, reg);
-    return inp(0x71);
-}
-
-static int bcd(int v)
-{
-    int alto = v >> 4;
-    /* 10*alto con desplazamientos, sin multiplicar */
-    return (v & 0x0F) + (alto << 3) + (alto << 1);
-}
-
-/* dia del mes desde el RTC del CMOS (70h/71h); mes y anio solo para
-   validar; si el RTC delira, reserva con int 21h AH=2Ah */
-static void lee_fecha(int *dia)
-{
-    unsigned char b;
-    int d, m, y, c;
-    long guardia = 0;                 /* long: con int de 16 bits no llegaria */
-    while ((cmos_lee(0x0A) & 0x80) != 0) {   /* espera fin de actualizacion */
-        if (++guardia > 100000L) break;
-    }
-    d = cmos_lee(0x07);
-    m = cmos_lee(0x08);
-    y = cmos_lee(0x09);
-    c = cmos_lee(0x32);
-    b = cmos_lee(0x0B);
-    if ((b & 0x04) == 0) {       /* BCD -> binario */
-        d = bcd(d); m = bcd(m); y = bcd(y); c = bcd(c);
-    }
-    if (c < 19 || c > 21) c = 20;      /* siglo plausible */
-    y += c * 100;
-    if (d < 1 || d > 31 || m < 1 || m > 12 || y < 1980 || y > 2099) {
-        union REGS r;
-        r.w.ax = 0x2A00;
-        int86(0x21, &r, &r);
-        *dia = r.h.dl;
-        return;
-    }
-    *dia = d;
+    union REGS r;
+    r.h.ah = 0x2A;
+    int86(0x21, &r, &r);
+    return r.h.dl;
 }
 
 /* ==================== memoria de trabajo ==================== */
@@ -582,12 +530,15 @@ static int reservar(void)
 
 /* ==================== montaje de la imagen ==================== */
 
-/* Descompresion RLE estilo PCX directamente a la VRAM visible: una
-   sola tira que se escribe de izquierda a derecha por la franja
-   central (STRIP_W columnas desde STRIP_X).  Un byte >= C0h es un par
-   contador/valor (1..63 pixeles del byte siguiente); un byte < C0h es
-   un pixel suelto.  Cada tira de la corrida se escribe con UN memset
-   (bloque) y la fila avanza con un puntero, sin multiplicar. */
+/* Descompresion RLE directamente a la VRAM visible: una sola tira que
+   se escribe de izquierda a derecha por la franja central (STRIP_W
+   columnas desde STRIP_X).  Los pixeles son indices 0..249, de modo que
+   los bytes 250..255 sirven de marca de racha:
+       b < 250      un pixel suelto
+       b = 251..255 racha de b-248 (3..7) pixeles del byte siguiente
+       b = 250      racha larga: byte de cuenta (8..255) y byte valor
+   Cada tira de la corrida se escribe con UN memset (bloque) y la fila
+   avanza con un puntero, sin multiplicar. */
 static void decodificar_fondo(void)
 {
     const unsigned char *p   = FONDO_RLE;
@@ -598,8 +549,8 @@ static void decodificar_fondo(void)
     while (p < fin) {
         unsigned char v = *p++;
         unsigned n = 1;
-        if ((v & 0xC0) == 0xC0) {
-            n = (unsigned)(v & 0x3Fu);
+        if (v >= 250) {
+            n = (v == 250) ? (unsigned)*p++ : (unsigned)(v - 248);
             v = *p++;
         }
         while (n != 0u) {
@@ -624,7 +575,7 @@ static void decodificar_fondo(void)
    offset de la VRAM avanza por suma (320 por fila), sin multiplicar. */
 static void montar(void)
 {
-    unsigned off = OFF320(DIAL_Y) + (unsigned)DIAL_X;   /* 15*320+75 */
+    unsigned off = OFF320(DIAL_Y) + (unsigned)DIAL_X;   /* 15*320+76 */
     int f, i;
 
     outp(0x3C8, 0);
@@ -642,156 +593,98 @@ static void montar(void)
     }
 }
 
-/* ==================== redibujado parcial por cajas ==================== */
+/* ==================== bucle principal ==================== */
 
-/* Cada aguja recuerda la caja (rectangulo) que toco.  Al actualizar:
-   1) se restaura el fondo de la caja VIEJA de cada aguja cambiada
-      (copiando de la esfera limpia), 2) se dibujan TODAS las agujas
-      en orden (hora, minuto, segundero, remache) para respetar el
-      solape, y 3) se vuela a VRAM solo la union de cajas vieja/nueva
-      de las agujas que cambiaron.  El remache nunca necesita caja
-      propia: siempre queda dentro de la del segundero. */
-static int caja[3][4];        /* 0 = hora, 1 = minuto, 2 = segundero */
-static int hay_cajas = 0;
-static unsigned a_h0 = 0xFFFFu, a_m0 = 0xFFFFu, a_s0 = 0xFFFFu;
-
-static void dibuja_agujas(unsigned a_h, unsigned a_m, unsigned a_s)
+/* fotograma en el marco de RAM.  Primero devuelve a su estado de esfera
+   limpia (copiando de ESFERA) las franjas que pintaron las agujas del
+   fotograma anterior; despues pinta las nuevas, anotando sus franjas en
+   el otro juego.  Las franjas se ensanchan a palabras: x par ..
+   x impar (DIAL_W es par, asi que no se sale de la fila). */
+static void compone(unsigned a_h, unsigned a_m, unsigned a_s)
 {
-    marca_reset();
-    baston2(a_h, R_AG_H, COL_H, HW_H);
-    caja[0][0] = ax0; caja[0][1] = ay0; caja[0][2] = ax1; caja[0][3] = ay1;
-    marca_reset();
-    baston2(a_m, R_AG_M, COL_M, HW_M);
-    caja[1][0] = ax0; caja[1][1] = ay0; caja[1][2] = ax1; caja[1][3] = ay1;
-    marca_reset();
-    segundero(a_s);
-    caja[2][0] = ax0; caja[2][1] = ay0; caja[2][2] = ax1; caja[2][3] = ay1;
-    centro();                    /* siempre dentro de la caja del segundero */
-}
+    const int *pmin = suc_min[act], *pmax = suc_max[act];
+    unsigned off = 0;
+    int y, x1;
 
-/* fondo limpio (esfera) sobre el marco, en una caja */
-static void restaura(int x0, int y0, int x1, int y1)
-{
-    int y;
-    if (x0 < 0) x0 = 0;
-    if (y0 < 0) y0 = 0;
-    if (x1 > DIAL_W - 1) x1 = DIAL_W - 1;
-    if (y1 > DIAL_H - 1) y1 = DIAL_H - 1;
-    if (x0 > x1 || y0 > y1) return;
-    if (x0 == 0 && y0 == 0 && x1 == DIAL_W - 1 && y1 == DIAL_H - 1) {
-        _fmemcpy(MARCO, ESFERA, DIAL_TAM);     /* fotograma completo */
-        return;
-    }
-    for (y = y0; y <= y1; y++)
-        _fmemcpy(MARCO + OFF170(y) + (unsigned)x0,
-                 ESFERA + OFF170(y) + (unsigned)x0,
-                 (unsigned)(x1 - x0 + 1));
-}
-
-/* caja del marco compuesto -> VRAM (por filas, _fmemcpy = rep movsw) */
-static void vuelca(int x0, int y0, int x1, int y1)
-{
-    int y;
-    if (x0 < 0) x0 = 0;
-    if (y0 < 0) y0 = 0;
-    if (x1 > DIAL_W - 1) x1 = DIAL_W - 1;
-    if (y1 > DIAL_H - 1) y1 = DIAL_H - 1;
-    if (x0 > x1 || y0 > y1) return;
-    for (y = y0; y <= y1; y++)
-        _fmemcpy((unsigned char far *)MK_FP(0xA000,
-                 OFF320(DIAL_Y + y) + (unsigned)DIAL_X + (unsigned)x0),
-                 MARCO + OFF170(y) + (unsigned)x0,
-                 (unsigned)(x1 - x0 + 1));
-}
-
-/* un paso de reloj: solo toca la RAM y la VRAM donde hizo falta.
-   forzar=1 tras recocinar la fecha (la esfera cambio): fotograma
-   entero, que la ventanita puede quedar fuera de todas las cajas. */
-static void actualiza(unsigned a_h, unsigned a_m, unsigned a_s, int forzar)
-{
-    int cambio[3];
-    int vieja[3][4];
-    int i, x0, x1, y0, y1;
-
-    cambio[0] = forzar || (a_h != a_h0);
-    cambio[1] = forzar || (a_m != a_m0);
-    cambio[2] = forzar || (a_s != a_s0);
-    if (!cambio[0] && !cambio[1] && !cambio[2]) return;
-    if (forzar) hay_cajas = 0;
-
-    if (hay_cajas) {
-        for (i = 0; i < 3; i++) {
-            if (!cambio[i]) continue;
-            vieja[i][0] = caja[i][0]; vieja[i][1] = caja[i][1];
-            vieja[i][2] = caja[i][2]; vieja[i][3] = caja[i][3];
-            restaura(vieja[i][0], vieja[i][1], vieja[i][2], vieja[i][3]);
+    for (y = 0; y < DIAL_H; y++) {
+        if (pmax[y] >= pmin[y]) {
+            x1 = pmin[y] & ~1;
+            _fmemcpy(MARCO + off + x1, ESFERA + off + x1,
+                     (unsigned)((pmax[y] | 1) - x1 + 1));
         }
-    } else {
-        restaura(0, 0, DIAL_W - 1, DIAL_H - 1);   /* fotograma completo */
+        off += DIAL_W;
     }
+    act ^= 1;
+    cmin = suc_min[act];
+    cmax = suc_max[act];
+    memset((char *)cmin, 0x7F, sizeof(suc_min[0]));
+    memset((char *)cmax, 0x80, sizeof(suc_max[0]));
 
     lienzo = MARCO;
-    dibuja_agujas(a_h, a_m, a_s);
-
-    if (hay_cajas) {
-        for (i = 0; i < 3; i++) {
-            if (!cambio[i]) continue;
-            x0 = (vieja[i][0] < caja[i][0]) ? vieja[i][0] : caja[i][0];
-            y0 = (vieja[i][1] < caja[i][1]) ? vieja[i][1] : caja[i][1];
-            x1 = (vieja[i][2] > caja[i][2]) ? vieja[i][2] : caja[i][2];
-            y1 = (vieja[i][3] > caja[i][3]) ? vieja[i][3] : caja[i][3];
-            vuelca(x0, y0, x1, y1);
-        }
-    } else {
-        vuelca(0, 0, DIAL_W - 1, DIAL_H - 1);     /* fotograma completo */
-    }
-
-    hay_cajas = 1;
-    a_h0 = a_h; a_m0 = a_m; a_s0 = a_s;
+    baston2(a_h, R_AG_H, COL_H, HW_H);
+    baston2(a_m, R_AG_M, COL_M, HW_M);
+    segundero(a_s);
+    centro();
 }
 
-/* ==================== bucle principal ==================== */
+/* vuelca a la VRAM lo que cambia: por fila, la union de las franjas del
+   fotograma anterior (hay que borrarlas) y del nuevo (hay que pintarlas).
+   Se llama justo despues de espera_retrazo(), asi que en la pantalla
+   nunca aparece un fotograma a medias. */
+static void volcar(void)
+{
+    const int *pmin = suc_min[act ^ 1], *pmax = suc_max[act ^ 1];
+    unsigned mo = 0;                                  /* fila en MARCO */
+    unsigned vo = OFF320(DIAL_Y) + (unsigned)DIAL_X;  /* fila en VRAM  */
+    int y, x1, x2;
+
+    for (y = 0; y < DIAL_H; y++) {
+        x1 = cmin[y]; if (pmin[y] < x1) x1 = pmin[y];
+        x2 = cmax[y]; if (pmax[y] > x2) x2 = pmax[y];
+        if (x2 >= x1) {
+            x1 &= ~1;
+            _fmemcpy((unsigned char far *)MK_FP(0xA000, vo + x1),
+                     MARCO + mo + x1, (unsigned)((x2 | 1) - x1 + 1));
+        }
+        mo += DIAL_W;
+        vo += 320u;
+    }
+}
 
 /* convierte tics del BIOS en angulos (1/256 de vuelta) de las agujas.
    El PIT del BIOS marca 1.193182 MHz / 65536 = 18.2065 tics/s, de
    modo que segundos = tics * 2000 / 36413 (exacto, sin deriva) y
    r = resto en unidades de 1/36413 s, que da el barrido suave.
-   Los productos van con desplazamientos; quedan solo las tres
-   divisiones de los angulos, que se necesitan para no derivar. */
+   El tiempo en 1/256 de segundo, t256 = seg*256 + sub, da los tres
+   angulos con UNA division cada uno y sin trocear en h/m/s:
+       segundero  = (t256 / 60)    & 255      (60 s por vuelta)
+       minutero   = (t256 / 3600)  & 255      (1 h por vuelta)
+       horario    = (t256 / 43200) & 255      (12 h por vuelta)
+   (el contador del BIOS se pone a cero a medianoche: seg < 86400).
+   Los productos van con desplazamientos.  Solo se llama cuando
+   cambia el tic. */
 static void angulos(unsigned long tk, unsigned *a_h, unsigned *a_m,
-                    unsigned *a_s, unsigned long *sod)
+                    unsigned *a_s)
 {
     /* tk * 2000 = 1024+512+256+128+64+16 veces tk */
     unsigned long t2k = (tk << 10) + (tk << 9) + (tk << 8)
                       + (tk << 7) + (tk << 6) + (tk << 4);
-    unsigned long total = t2k / 36413UL;                   /* s desde las 0h */
-    unsigned long sd    = total % 86400UL;
-    unsigned long r     = t2k - total * 36413UL;           /* 0..36412 */
-    unsigned long sub   = (r << 8) / 36413UL;              /* 0..255 */
-    unsigned long h  = sd / 3600UL;
-    unsigned long m  = (sd / 60UL) % 60UL;
-    unsigned long s  = sd % 60UL;
-    unsigned long m60  = (m << 5) + (m << 4) + (m << 3) + (m << 2) + s;
-    unsigned long hm   = (((h % 12UL) << 11) + ((h % 12UL) << 10)
-                          + ((h % 12UL) << 9) + ((h % 12UL) << 4))
-                         + m60;
+    unsigned long seg = t2k / 36413UL;                     /* s desde las 0h */
+    unsigned long r   = t2k - seg * 36413UL;               /* 0..36412 */
+    unsigned long t256 = (seg << 8) + (r << 8) / 36413UL;
 
-    *a_s = (unsigned)(((s << 8) + sub) / 60UL);
-    *a_m = (unsigned)(((m60 << 8) + sub) / 3600UL);
-    *a_h = (unsigned)(((hm << 8) + sub) / 43200UL);
-    *sod = sd;
+    *a_s = (unsigned)(t256 / 60UL) & 255u;
+    *a_m = (unsigned)(t256 / 3600UL) & 255u;
+    *a_h = (unsigned)(t256 / 43200UL) & 255u;
 }
 
 void programa(void)
 {
-    unsigned long tk, tk_ant = 0, sod = 0, sod_ant = 0;
-    unsigned a_h = 0, a_m = 0, a_s = 0;
-    int primero = 1;
-    int dia = 1;
+    unsigned long tk, tk_ant;
+    unsigned a_h, a_m, a_s;
+    unsigned p_h = 0xFFFFu, p_m = 0xFFFFu, p_s = 0xFFFFu;  /* ya dibujados */
     unsigned char t;
     union REGS r;
-
-    lee_fecha(&dia);
 
     if (!reservar()) {
         /* en modo texto: aviso y fuera (AH=09h, DS:DX -> cadena $) */
@@ -805,7 +698,8 @@ void programa(void)
 
     modo_video(0x13);
     montar();
-    pinta_fecha(dia);
+    pinta_fecha(lee_fecha());
+    tk_ant = lee_ticks() - 1;            /* != tk: el primer fotograma sale ya */
 
     for (;;) {
         while (tecla(&t)) {
@@ -815,27 +709,23 @@ void programa(void)
             }
             /* cualquier otra tecla se descarta del buffer */
         }
-        espera_retrazo();
         tk = lee_ticks();
-        if (tk == tk_ant) continue;  /* sin tic nuevo no puede moverse nada */
-        tk_ant = tk;
-        angulos(tk, &a_h, &a_m, &a_s, &sod);
-        if (!primero && sod < sod_ant) {       /* cruzo la medianoche */
-            lee_fecha(&dia);
-            pinta_fecha(dia);
-            actualiza(a_h, a_m, a_s, 1);       /* la esfera cambio: entero */
-        } else {
-            actualiza(a_h, a_m, a_s, 0);       /* solo lo que cambio */
+        if (tk == tk_ant) continue;            /* mismo tic: nada que hacer */
+        if (tk < tk_ant) {                     /* cruzo la medianoche */
+            pinta_fecha(lee_fecha());
         }
-        sod_ant = sod;
-        primero = 0;
+        tk_ant = tk;
+        angulos(tk, &a_h, &a_m, &a_s);
+        if (a_h == p_h && a_m == p_m && a_s == p_s) continue;  /* igual */
+        p_h = a_h; p_m = a_m; p_s = a_s;
+        compone(a_h, a_m, a_s);
+        espera_retrazo();                      /* y SOLO ahora, a la VRAM */
+        volcar();
     }
 }
 
-#ifndef ROLEX_HOST
 int main(void)
 {
     programa();
     return 0;
 }
-#endif

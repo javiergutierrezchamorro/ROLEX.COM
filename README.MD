@@ -2,11 +2,11 @@
 
 An open-source clone of the `ROLEX.COM` screensaver by RIX SoftWorks (1985, 1986), updated with a real photograph: a steel Rolex Oyster Perpetual Datejust against a black background, featuring a clean dial (without hands) onto which the hours, minutes, seconds, and current date are rendered in real time.
 
-<img src="_Res/rolex_000.png" alt="ROLEX.COM (c) Copyright 2026 by Javier Gutiérrez Chamorro (Guti)">
+<img src="_RES/rolex_000.png" alt="ROLEX.COM (c) Copyright 2026 by Javier Gutiérrez Chamorro (Guti)">
 
 Like me even before [Guardatiempo](https://guardatiempo.com/), many of you will recall computer store windows in the late 1980s and early 1990s displaying a Rolex clock showing the actual time. It was either that or the Landmark Speed Test. As a watch enthusiast, that left a lasting impression on me: a Rolex Oyster Quartz running on a colorful DOS screen. I tried programming something similar multiple times—first in Turbo BASIC 1.1, later in Turbo C 2.0 using `EGAVBA.BGI`, and eventually in Turbo Pascal 6 with inline assembly. All of those attempts remained incomplete.
 
-<img src="_Res/rolex_001.png" alt="ROLEX.COM (c) Copyright 1985,1986 by RIX Softworks, Inc.">
+<img src="_RES/rolex_001.png" alt="ROLEX.COM (c) Copyright 1985,1986 by RIX Softworks, Inc.">
 
 The original development by RIX Softworks, Inc. in Turbo Pascal 3 (1985) ran in EGA mode at 640x350 resolution with 16 colors—state of the art for its era.
 

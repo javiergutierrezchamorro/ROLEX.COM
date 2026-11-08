@@ -12,9 +12,9 @@ The original development by RIX Softworks, Inc. in Turbo Pascal 3 (1985) ran in 
 
 This version of `ROLEX.COM` (2026) by Javier Gutiérrez Chamorro (Guti), built with OpenWatcom 2.0 (2026), runs at 320x200 resolution with 256 colors, delivering a near-photorealistic display.
 
-While the RIX release occupied over 70 KB across two files (the main executable and screen data), this implementation bundles everything into a single COM executable weighing just 25.1 KB (23 KB compressed via UPX).
+While the RIX release occupied over 70 KB across two files (the main executable and screen data), this implementation bundles everything into a single COM executable without external dependencies weighing just 25.1 KB (23 KB compressed via UPX).
 
-On a standard 4.77 MHz IBM PC, `ROLEX.COM` executes two to three times faster while explicitly avoiding inline assembly (`#pragma aux`). The codebase is 100% pure C, maximizing efficiency through direct hardware manipulation: writing straight to VGA VRAM at segment `0xA000`, reading keypresses and timer ticks directly from the BIOS Data Area at `0x0040`, and programming the DAC color palette registers directly.
+On a standard 4.77 MHz IBM PC, `ROLEX.COM` executes two to four times faster while explicitly avoiding inline assembly (`#pragma aux`). The codebase is 100% pure C, maximizing efficiency through direct hardware manipulation: writing straight to VGA VRAM at segment `0xA000`, reading keypresses and timer ticks directly from the BIOS Data Area at `0x0040`, and programming the DAC color palette registers directly.
 
 The watch model has been updated to an automatic Rolex Datejust, with refined, realistic hand rendering and polished visual performance.
 

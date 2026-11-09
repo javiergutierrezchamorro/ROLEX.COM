@@ -114,7 +114,7 @@
 /* IMGRLE.H lo genera prep_img.py desde las FOTOS (esfera2.jpg y
    reloj2.png): geometria calibrada (DIAL_*, STRIP_*, VEN_* y agujas),
    la paleta PALETA[768] y el fondo FONDO_RLE[] (RLE propio). */
-#include "IMGRLE.H"
+#include "ROLEX.H"
 
 /* ============================ constantes ============================ */
 

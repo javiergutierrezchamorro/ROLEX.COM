@@ -21,7 +21,8 @@
  *   - SOLO SE REDIBUJA CUANDO CAMBIA UN ANGULO.  El angulo va en 1/256
  *     de vuelta y sale de los tics del BIOS (18.2 por segundo): el
  *     segundero cambia unas 4 veces por segundo y las otras agujas casi
- *     nunca.  El resto del tiempo el bucle solo mira tics y teclado.
+ *     nunca.  El resto del tiempo el bucle solo mira tics, altavoz y
+ *     teclado.
  *   - Fuera multiplicaciones y divisiones de los caminos calientes
  *     (los bucles por pixel y por fila): el offset de cada fila de la
  *     esfera sale de una TABLA (fila170[], rellena por sumas; en un
@@ -70,6 +71,26 @@
  * (tics * 2000 / 36413; 18.2065 tics/s, sin deriva).  Fecha del DOS
  * (int 21h AH=2Ah) al arrancar y al cruzar medianoche.  ESC leyendo el
  * buffer del BIOS en 0040:001A.
+ *
+ * TIC-TAC: cuatro pitidos por segundo por el altavoz del PC, con el
+ * canal 2 del PIT (8253) y el puerto 61h.  El pulso es el contador de
+ * cuartos de segundo de t256 (t256 >> 6; 64 unidades de 1/256 s =
+ * 250 ms), que se mira solo cuando cambia el tic del BIOS.  El pitido
+ * se enciende al cruzar cada cuarto de segundo y se apaga EN EL TIC
+ * SIGUIENTE: ~55 ms de tono y ~195 ms de silencio, sin esperas activas
+ * ni interrupciones.  Tic y tac alternan la frecuencia (paridad del
+ * contador) y los divisores del PIT (1193182/frecuencia) van como
+ * CONSTANTES: en el 8086 una division de 16 bits cuesta mas de 20
+ * ciclos y aqui no hace falta ninguna.
+ *
+ * SALIDA: sin cputs ni int 21h AH=09h; una franja de texto DIRECTA a
+ * la VRAM de video (B800:0000), fila 0 completa de 80 columnas con
+ * fondo azul y letra blanca (atributo 1Fh) y el cursor en la fila 1,
+ * columna 0 (int 10h AH=02h).  La misma rutina vale para el copyright
+ * y para el aviso de falta de memoria.  (El modo 13h ya exige adaptador
+ * de color: la VRAM de texto es B800 y no hace falta distinguir de la
+ * B000 de la monocroma.)
+ *
  * Aritmetica entera: tabla de senos Q8.  El angulo va en 1/256 de
  * vuelta (0 = las 12, horario).
  *
@@ -84,8 +105,8 @@
  *      python3 prep_img.py reloj2.png esfera2.jpg IMGRLE.H
  */
 
-#include <dos.h>     /* MK_FP, union REGS, SREGS, int86x, FP_OFF */
-#include <conio.h>   /* inp, outp, cputs                  */
+#include <dos.h>     /* MK_FP, union REGS, SREGS, int86x  */
+#include <conio.h>   /* inp, outp                        */
 #include <string.h>  /* memcpy, memset, _fmemcpy, _fmemset */
 
 /* ==================== imagen incrustada ==================== */
@@ -190,6 +211,13 @@ static int act;
 static int *cmin = suc_min[0];
 static int *cmax = suc_max[0];
 
+/* anota el tramo [x1, x2] en la fila y.  ATENCION al orden: x1 SOLO
+   puede bajar cmin y x2 SOLO puede subir cmax, asi que el tramo tiene
+   que llegar ORDENADO (el menor primero).  linea() pinta el segundero
+   tambien hacia atras (sx = -1) y sus tramos de fila salen invertidos:
+   por eso los ordena antes de llamar.  Con los extremos cruzados la
+   franja queda "vacia" (min > max) y esos pixeles ni se borran del
+   marco ni se vuelcan a la VRAM: la aguja deja rastro. */
 static __inline void sucia(int x1, int x2, int y)
 {
     if (x1 < cmin[y]) cmin[y] = x1;
@@ -272,9 +300,9 @@ static void poligono(int n, const int *xs, const int *ys, unsigned char c)
             linea_h(cruce_min[y], cruce_max[y], y, c);
 }
 
-/* disco solido (contrapeso del segundero y remache central): radio
-   incremental, raiz cuadrada incremental y cada fila de UNA vez con
-   linea_h (memset), sin bucles de pixeles */
+/* disco solido (remache central): radio incremental, raiz cuadrada
+   incremental y cada fila de UNA vez con linea_h (memset), sin bucles
+   de pixeles */
 static void disco(int cx, int cy, int r, unsigned char c)
 {
     int dy, dy2 = 0;        /* dy*dy, incremental */
@@ -329,7 +357,10 @@ static void punto(int s, int c, int rr, int k, int *x, int *y)
 /* linea de Bresenham (segundero), POR PUNTERO: sin recorte (la
    comprobacion #if de arriba garantiza que cae dentro del dial), sin
    calcular el offset por pixel y anotando la franja sucia UNA vez por
-   fila (tramo xr..xa) en vez de en cada pixel */
+   fila (tramo xr..xa, ORDENADO antes de sucia(): con sx = -1 sale
+   invertido y una franja cruzada no se borraria: rastro) en vez de en
+   cada pixel.  La rama de orden no cuesta: el sentido de la marcha es
+   fijo en toda la linea y el 8086 la pre-carga siempre igual. */
 static void linea(int x0, int y0, int x1, int y1, unsigned char c)
 {
     int dx = x1 - x0, dy = y1 - y0;
@@ -516,6 +547,64 @@ static int lee_fecha(void)
     return r.h.dl;
 }
 
+/* ==================== tic-tac del altavoz ==================== */
+
+/* Cuatro pitidos por segundo por el altavoz del PC: canal 2 del PIT
+   (8253/8254) al puerto 42h y bits 0 (puerta) y 1 (altavoz) del 61h.
+   Sin esperas activas ni interrupciones: el pitido se enciende al
+   cruzar cada cuarto de segundo (angulos() ya calcula t256; el
+   contador es t256 >> 6) y se apaga EN EL TIC SIGUIENTE del BIOS:
+   ~55 ms de tono, ~195 ms de silencio.  Tic y tac alternan la
+   frecuencia (paridad del contador).  Los divisores del PIT son
+   1193182 / frecuencia: van como CONSTANTES de 16 bits (lo primero el
+   byte bajo, luego el alto, tras el comando B6h), sin ninguna
+   division en el 8086. */
+static void pitido(unsigned cuarto)
+{
+    outp(0x43, 0xB6);                       /* canal 2, modo 3, lo/hi */
+    if (cuarto & 1u) {                      /* tac: 900 Hz            */
+        outp(0x42, 0x2E); outp(0x42, 0x05); /* 1326 = 1193182/900    */
+    } else {                                /* tic: 1000 Hz           */
+        outp(0x42, 0xA9); outp(0x42, 0x04); /* 1193 = 1193182/1000   */
+    }
+    outp(0x61, inp(0x61) | 0x03);           /* puerta del canal 2 + altavoz */
+}
+
+/* apaga el altavoz dejando intactos los demas bits del puerto 61h */
+static void callar(void)
+{
+    outp(0x61, inp(0x61) & ~0x03);
+}
+
+/* ==================== franja de texto de salida ==================== */
+
+/* fila 0 completa de la VRAM de texto (B800:0000), 80 palabras de
+   char + atributo 1Fh (fondo azul, letra blanca), con el mensaje
+   desde la columna 0 y espacios hasta el final; despues deja el
+   cursor en la fila 1, columna 0 (int 10h AH=02h).  Directo a la
+   VRAM, sin cputs ni int 21h: 80 palabras y una sola int 10h.  Vale
+   para el copyright al salir y para el aviso de falta de memoria
+   (los dos salen con el reloj apagado, en modo texto de 80x25). */
+static void banner(const char *msg)
+{
+    unsigned short far *v = (unsigned short far *)MK_FP(0xB800, 0);
+    unsigned n = 0;
+    union REGS r;
+    int i;
+
+    for (i = 0; i < 80; i++) {
+        unsigned char c = (unsigned char)msg[n];
+        if (c != 0) n++;
+        else         c = ' ';
+        v[i] = 0x1F00u | c;
+    }
+    r.h.ah = 0x02;               /* colocar el cursor */
+    r.h.bh = 0x00;               /* pagina 0          */
+    r.h.dh = 0x01;               /* fila 1            */
+    r.h.dl = 0x00;               /* columna 0         */
+    int86(0x10, &r, &r);
+}
+
 /* ==================== memoria de trabajo ==================== */
 
 /* Pide al DOS un bloque de 64 KB (0x1000 parrafos) para el marco y la
@@ -695,9 +784,12 @@ static void volcar(void)
     }
 }
 
-/* convierte tics del BIOS en angulos (1/256 de vuelta) de las agujas.
-   El PIT del BIOS marca 1.193182 MHz / 65536 = 18.2065 tics/s, de
-   modo que segundos = tics * 2000 / 36413 (exacto, sin deriva) y
+/* convierte tics del BIOS en angulos (1/256 de vuelta) de las agujas
+   y en PULSO, el contador de cuartos de segundo (t256 >> 6; 64
+   unidades de 1/256 s = 250 ms) que marca el tic-tac del altavoz:
+   cuatro pulsaciones por segundo exactas y sin ninguna division
+   nueva.  El PIT del BIOS marca 1.193182 MHz / 65536 = 18.2065 tics/s,
+   de modo que segundos = tics * 2000 / 36413 (exacto, sin deriva) y
    r = resto en unidades de 1/36413 s, que da el barrido suave.
    El tiempo en 1/256 de segundo, t256 = seg*256 + sub, da los tres
    angulos (el contador del BIOS se pone a cero a medianoche: seg <
@@ -711,7 +803,7 @@ static void volcar(void)
    largas para los angulos, la ultima de 16 bits.  Los productos van
    con desplazamientos.  Solo se llama cuando cambia el tic. */
 static void angulos(unsigned long tk, unsigned *a_h, unsigned *a_m,
-                    unsigned *a_s)
+                    unsigned *a_s, unsigned *pulso)
 {
     /* tk * 2000 = 1024+512+256+128+64+16 veces tk */
     unsigned long t2k = (tk << 10) + (tk << 9) + (tk << 8)
@@ -725,23 +817,21 @@ static void angulos(unsigned long tk, unsigned *a_h, unsigned *a_m,
     *a_s = (unsigned)vs & 255u;
     *a_m = (unsigned)vm & 255u;
     *a_h = ((unsigned)vm / 12u) & 255u;
+    *pulso = (unsigned)(t256 >> 6) & 255u;
 }
 
 int main(void)
 {
     unsigned long tk, tk_ant;
-    unsigned a_h, a_m, a_s;
+    unsigned a_h, a_m, a_s, pul;
     unsigned p_h = 0xFFFFu, p_m = 0xFFFFu, p_s = 0xFFFFu;  /* ya dibujados */
+    unsigned p_pul = 0xFFFFu;           /* ultimo cuarto de segundo pitado  */
     unsigned char t;
-    union REGS r;
+    int sonando = 0;                    /* 1 = el altavoz sigue encendido    */
 
     if (!reservar()) {
-        /* en modo texto: aviso y fuera (AH=09h, DS:DX -> cadena $) */
-        static const char sin_mem[] =
-            "ROLEX: falta memoria libre para el doble bufer (64 KB).\r\n$";
-        r.h.ah = 0x09;
-        r.x.dx = FP_OFF(sin_mem);
-        int86(0x21, &r, &r);
+        /* en modo texto: franja azul y fuera */
+        banner("ROLEX: falta memoria libre para el doble bufer (64 KB).");
         return 1;
     }
 
@@ -753,9 +843,10 @@ int main(void)
     for (;;) {
         while (tecla(&t)) {
             if (t == 27) {                     /* ESC -> salir */
+                callar();                      /* que no quede el altavoz on */
                 modo_video(0x03);
                 /* \x82 = e con acento en CP437/CP850 (el fuente va en UTF-8) */
-                cputs("ROLEX.COM v6 (c) Copyright 2026 by Javier Guti\x82rrez Chamorro (Guti)\r\n");
+                banner(" ROLEX.COM v6 (c) Copyright 2026 by Javier Guti\x82rrez Chamorro (Guti)");
                 return 0;
             }
             /* cualquier otra tecla se descarta del buffer */
@@ -764,9 +855,20 @@ int main(void)
         if (tk == tk_ant) continue;            /* mismo tic: nada que hacer */
         if (tk < tk_ant) {                     /* cruzo la medianoche */
             pinta_fecha(lee_fecha());
+            p_h = 0xFFFFu;  /* fecha nueva: redibuja ya aunque las agujas
+                               queden en el mismo sitio que las anteriores */
         }
         tk_ant = tk;
-        angulos(tk, &a_h, &a_m, &a_s);
+        angulos(tk, &a_h, &a_m, &a_s, &pul);
+        if (sonando) {                         /* el tic dura UN tic del BIOS */
+            callar();
+            sonando = 0;
+        }
+        if (pul != p_pul) {                    /* nuevo cuarto de segundo */
+            p_pul = pul;
+            pitido(pul);                       /* tic o tac: paridad de pul */
+            sonando = 1;
+        }
         if (a_h == p_h && a_m == p_m && a_s == p_s) continue;  /* igual */
         p_h = a_h; p_m = a_m; p_s = a_s;
         compone(a_h, a_m, a_s);

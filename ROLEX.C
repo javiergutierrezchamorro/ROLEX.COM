@@ -72,13 +72,17 @@
  * (int 21h AH=2Ah) al arrancar y al cruzar medianoche.  ESC leyendo el
  * buffer del BIOS en 0040:001A.
  *
- * TIC-TAC: cuatro pitidos por segundo por el altavoz del PC, con el
- * canal 2 del PIT (8253) y el puerto 61h.  El pulso es el contador de
- * cuartos de segundo de t256 (t256 >> 6; 64 unidades de 1/256 s =
- * 250 ms), que se mira solo cuando cambia el tic del BIOS.  El pitido
- * se enciende al cruzar cada cuarto de segundo y se apaga EN EL TIC
- * SIGUIENTE: ~55 ms de tono y ~195 ms de silencio, sin esperas activas
- * ni interrupciones.  Tic y tac alternan la frecuencia (paridad del
+ * TIC-TAC: cuatro pulsaciones por segundo, con PRIORIDAD FM.  Si hay
+ * un YM3812 (Adlib o Sound Blaster) en 388h/389h, el tic-tac sale por
+ * FM: un click por cuarto de segundo con envolvente de caida propia,
+ * sin tener que apagar nada.  Si no hay chip, FALLBACK al altavoz del
+ * PC: canal 2 del PIT (8253) al puerto 42h y bits 0 (puerta) y 1
+ * (altavoz) del 61h.  El pulso es el contador de cuartos de segundo de
+ * t256 (t256 >> 6; 64 unidades de 1/256 s = 250 ms), que se mira solo
+ * cuando cambia el tic del BIOS.  En el altavoz, el pitido se enciende
+ * al cruzar cada cuarto de segundo y se apaga EN EL TIC SIGUIENTE:
+ * ~55 ms de tono y ~195 ms de silencio, sin esperas activas ni
+ * interrupciones.  Tic y tac alternan la frecuencia (paridad del
  * contador) y los divisores del PIT (1193182/frecuencia) van como
  * CONSTANTES: en el 8086 una division de 16 bits cuesta mas de 20
  * ciclos y aqui no hace falta ninguna.
@@ -547,18 +551,18 @@ static int lee_fecha(void)
     return r.h.dl;
 }
 
-/* ==================== tic-tac del altavoz ==================== */
+/* ==================== tic-tac del altavoz (FALLBACK) ==================== */
 
-/* Cuatro pitidos por segundo por el altavoz del PC: canal 2 del PIT
-   (8253/8254) al puerto 42h y bits 0 (puerta) y 1 (altavoz) del 61h.
-   Sin esperas activas ni interrupciones: el pitido se enciende al
-   cruzar cada cuarto de segundo (angulos() ya calcula t256; el
-   contador es t256 >> 6) y se apaga EN EL TIC SIGUIENTE del BIOS:
-   ~55 ms de tono, ~195 ms de silencio.  Tic y tac alternan la
-   frecuencia (paridad del contador).  Los divisores del PIT son
-   1193182 / frecuencia: van como CONSTANTES de 16 bits (lo primero el
-   byte bajo, luego el alto, tras el comando B6h), sin ninguna
-   division en el 8086. */
+/* Cuatro pitidos por segundo por el altavoz del PC (FALLBACK cuando
+   no hay YM3812): canal 2 del PIT (8253/8254) al puerto 42h y bits 0
+   (puerta) y 1 (altavoz) del 61h.  Sin esperas activas ni
+   interrupciones: el pitido se enciende al cruzar cada cuarto de
+   segundo (angulos() ya calcula t256; el contador es t256 >> 6) y se
+   apaga EN EL TIC SIGUIENTE del BIOS: ~55 ms de tono, ~195 ms de
+   silencio.  Tic y tac alternan la frecuencia (paridad del contador).
+   Los divisores del PIT son 1193182 / frecuencia: van como CONSTANTES
+   de 16 bits (lo primero el byte bajo, luego el alto, tras el comando
+   B6h), sin ninguna division en el 8086. */
 static void pitido(unsigned cuarto)
 {
     outp(0x43, 0xB6);                       /* canal 2, modo 3, lo/hi */
@@ -574,6 +578,96 @@ static void pitido(unsigned cuarto)
 static void callar(void)
 {
     outp(0x61, inp(0x61) & ~0x03);
+}
+
+/* ==================== tic-tac FM (Adlib / Sound Blaster) ==================== */
+
+/* Si hay un YM3812 (OPL2) en 388h/389h, el tic-tac sale por FM en
+   vez de por el altavoz: un click por cuarto de segundo con envolvente
+   de caida, mas limpio y "relojero" que el pitido del PC.  Todo lo de
+   abajo son solo inp/outp a puertos de I/O, de modo que funciona en
+   8086 exactamente igual que en 386.  El YM3812 responde en 388h/389h
+   tanto en el Adlib como en cualquier Sound Blaster. */
+#define OPL_REG 0x388u
+#define OPL_DAT 0x389u
+
+/* escritura de registro con las esperas clasicas del Adlib, hechas
+   leyendo el propio puerto (6 lecturas tras el registro, 35 tras el
+   dato), como en los drivers de siempre */
+static void opl_escribe(unsigned char reg, unsigned char val)
+{
+    int i;
+    outp(OPL_REG, reg);
+    for (i = 0; i < 6; i++)  (void)inp(OPL_REG);
+    outp(OPL_DAT, val);
+    for (i = 0; i < 35; i++) (void)inp(OPL_REG);
+}
+
+/* deteccion clasica: apretar los timers del YM3812 y mirar el
+   registro de estado: limpio (0) tras el reset y, tras arrancar el
+   timer 1 y esperar sus 80 us, con el bit 7 (IRQ) y el 6 (timer 1) a
+   1, o sea 0xC0.  (Antes se comparaba con 0x40 y sin esperar: el
+   chip NUNCA se detectaba y el reloj quedaba siempre mudo.) */
+static int opl_presente(void)
+{
+    int s1, s2, i;
+    opl_escribe(0x04, 0x60);              /* reset de los timers     */
+    opl_escribe(0x04, 0x80);
+    s1 = inp(OPL_REG) & 0xE0;
+    opl_escribe(0x02, 0xFF);              /* timer 1 a tope, marcha  */
+    opl_escribe(0x04, 0x21);
+    for (i = 0; i < 200; i++) (void)inp(OPL_REG);   /* >= 80 us */
+    s2 = inp(OPL_REG) & 0xE0;
+    opl_escribe(0x04, 0x60);              /* y otra vez el reset     */
+    opl_escribe(0x04, 0x80);
+    return (s1 == 0x00) && (s2 == 0xC0);
+}
+
+/* canal 0 listo para clics: portadora a MULT 1 y modulador a MULT 15
+   con nivel de salida maximo (el brillo del click son los productos
+   de modulacion), envolvente de ataque inmediato (AR 15), caida corta
+   (DR 9: unos 10 ms; con DR 15 el click dura decimas de ms, unas
+   pocas muestras, y apenas se oye) y salida rapida (RR 15), sostenido
+   al fondo (SL 15) */
+static void opl_canal(void)
+{
+    opl_escribe(0x01, 0x20);              /* formas de onda del OPL2  */
+    opl_escribe(0x20, 0x0F);              /* modulador: MULT 15       */
+    opl_escribe(0x23, 0x01);              /* portadora: MULT 1        */
+    opl_escribe(0x40, 0x00);              /* modulador: nivel maximo  */
+    opl_escribe(0x43, 0x1D);              /* portadora: nivel justo   */
+    opl_escribe(0x60, 0xF9);              /* AR 15 / DR 9 (modulador) */
+    opl_escribe(0x63, 0xF9);              /* AR 15 / DR 9 (portadora) */
+    opl_escribe(0x80, 0xFF);              /* SL 15 / RR 15 (modulador)*/
+    opl_escribe(0x83, 0xFF);              /* SL 15 / RR 15 (portadora)*/
+    opl_escribe(0xE0, 0x00);              /* seno (modulador)        */
+    opl_escribe(0xE3, 0x00);              /* seno (portadora)         */
+    opl_escribe(0xC0, 0x00);              /* FM, sin realimentacion   */
+    opl_escribe(0xB0, 0x00);              /* canal apagado            */
+}
+
+/* el click: F-numero nuevo y key on; la caida de la envolvente (DR 9)
+   lo deja en silencio en unos pocos ms, listo para el siguiente, sin
+   tener que apagar nada (a diferencia del altavoz).  El tic (pulsos
+   pares) es mas agudo que el tac; el bloque 4 lleva la portadora a
+   ~510/315 Hz y el modulador a x15 (~7,6/4,7 kHz) */
+static void tic_tac(unsigned cuarto)
+{
+    unsigned fnum = (cuarto & 1u) ? 0x1A0u : 0x2A0u;
+    unsigned alto = (fnum >> 8) & 3u;
+
+    opl_escribe(0xA0, (unsigned char)(fnum & 0xFF));
+    opl_escribe(0xB0, (unsigned char)(alto | 0x10u));        /* key off */
+    opl_escribe(0xB0, (unsigned char)(alto | 0x10u | 0x20u)); /* key on */
+}
+
+/* apaga el canal FM y resetea los timers, para que no quede tono al
+   salir */
+static void opl_silencio(void)
+{
+    opl_escribe(0xB0, 0x00);              /* key off del canal 0 */
+    opl_escribe(0x04, 0x60);              /* reset de los timers */
+    opl_escribe(0x04, 0x80);
 }
 
 /* ==================== franja de texto de salida ==================== */
@@ -828,6 +922,7 @@ int main(void)
     unsigned p_pul = 0xFFFFu;           /* ultimo cuarto de segundo pitado  */
     unsigned char t;
     int sonando = 0;                    /* 1 = el altavoz sigue encendido    */
+    int opl;                            /* 1 = YM3812 detectado (tic-tac FM) */
 
     if (!reservar()) {
         /* en modo texto: franja azul y fuera */
@@ -838,12 +933,21 @@ int main(void)
     modo_video(0x13);
     montar();
     pinta_fecha(lee_fecha());
+
+    /* tic-tac: PRIORIDAD FM.  Si hay YM3812 (Adlib o Sound Blaster)
+       el tic-tac sale por FM (click por cuarto de segundo con caida
+       propia de la envolvente, sin tener que apagar nada).  Si no,
+       fallback al altavoz del PC (pitido/callar).  La deteccion se
+       hace una sola vez: opl queda fijo para todo el bucle. */
+    opl = opl_presente();
+    if (opl) opl_canal();
+
     tk_ant = lee_ticks() - 1;            /* != tk: el primer fotograma sale ya */
 
     for (;;) {
         while (tecla(&t)) {
             if (t == 27) {                     /* ESC -> salir */
-                callar();                      /* que no quede el altavoz on */
+                if (opl) opl_silencio(); else callar();  /* que no quede sonido */
                 modo_video(0x03);
                 /* \x82 = e con acento en CP437/CP850 (el fuente va en UTF-8) */
                 banner(" ROLEX.COM v6 (c) Copyright 2026 by Javier Guti\x82rrez Chamorro (Guti)");
@@ -860,14 +964,14 @@ int main(void)
         }
         tk_ant = tk;
         angulos(tk, &a_h, &a_m, &a_s, &pul);
-        if (sonando) {                         /* el tic dura UN tic del BIOS */
+        if (sonando) {                         /* altavoz: apaga el tic anterior */
             callar();
             sonando = 0;
         }
         if (pul != p_pul) {                    /* nuevo cuarto de segundo */
             p_pul = pul;
-            pitido(pul);                       /* tic o tac: paridad de pul */
-            sonando = 1;
+            if (opl) tic_tac(pul);             /* FM: click con caida propia */
+            else { pitido(pul); sonando = 1; } /* altavoz: ~55 ms de tono */
         }
         if (a_h == p_h && a_m == p_m && a_s == p_s) continue;  /* igual */
         p_h = a_h; p_m = a_m; p_s = a_s;
@@ -876,3 +980,4 @@ int main(void)
         volcar();
     }
 }
+

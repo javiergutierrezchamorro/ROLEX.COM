@@ -46,6 +46,14 @@
  *   - Bloques con memset/memcpy siempre que se puede: el fondo RLE se
  *     decodifica por tiras y la ventana de la fecha se borra por filas.
  *
+ * Mejoras v7 (C puro, sin ASM ni pragma aux):
+ *   - Tablas SIN256/COS256 de 256 entradas: lookup O(1) sin ramas.
+ *   - Fraccion de tic leyendo el contador del PIT canal 0 (latch) sin
+ *     reprogramar IRQ0: segundero sub-tick y hora del DOS intacta.
+ *   - Franjas sucias con margen de 1 px (menos rastros en diagonales).
+ *   - Speaker apagado por delta de tics (no solo "siguiente tic").
+ *   - espera_retrazo con timeout por tics BIOS (no cuelga si 3DAh falla).
+ *
  * Al arrancar:
  *   - PALETA (768 bytes) -> DAC (puertos 3C8h/3C9h), valores /4.
  *   - FONDO_RLE -> franja central de la VRAM en A000:0000 (a los lados
@@ -180,6 +188,35 @@ static const int SEN[65] = {
     251,  252,  253,  254,  255,  255,  256,  256,  256
 };
 
+/* Tablas completas de 256 angulos (1/256 de vuelta).  init_sincos() las
+   rellena UNA vez desde SEN[0..64] por simetria de cuadrantes. */
+static int SIN256[256];
+static int COS256[256];
+
+static void init_sincos(void)
+{
+    unsigned a;
+    for (a = 0; a < 256u; a++) {
+        unsigned q = (a >> 6) & 3u;
+        unsigned i = a & 63u;
+        int s;
+        if (q == 0u)      s =  SEN[i];
+        else if (q == 1u) s =  SEN[64u - i];
+        else if (q == 2u) s = -SEN[i];
+        else              s = -SEN[64u - i];
+        SIN256[a] = s;
+        {
+            unsigned ca = (64u - a) & 255u;
+            unsigned cq = (ca >> 6) & 3u;
+            unsigned ci = ca & 63u;
+            if (cq == 0u)      COS256[a] =  SEN[ci];
+            else if (cq == 1u) COS256[a] =  SEN[64u - ci];
+            else if (cq == 2u) COS256[a] = -SEN[ci];
+            else               COS256[a] = -SEN[64u - ci];
+        }
+    }
+}
+
 /* Digitos 5x7 para la fecha.  Bit 0x80 = pixel izquierdo (solo se usan
    los 5 bits altos).  Con 7 de ancho no cabia el pixel de separacion
    entre los dos digitos en una ventanita de 14: se pegaban. */
@@ -222,8 +259,11 @@ static int *cmax = suc_max[0];
    por eso los ordena antes de llamar.  Con los extremos cruzados la
    franja queda "vacia" (min > max) y esos pixeles ni se borran del
    marco ni se vuelcan a la VRAM: la aguja deja rastro. */
+/* margen 1 px: evita rastro residual en diagonales del Bresenham */
 static __inline void sucia(int x1, int x2, int y)
 {
+    if (x1 > 0) x1--;
+    if (x2 < DIAL_W - 1) x2++;
     if (x1 < cmin[y]) cmin[y] = x1;
     if (x2 > cmax[y]) cmax[y] = x2;
 }
@@ -330,18 +370,17 @@ static void disco(int cx, int cy, int r, unsigned char c)
     }
 }
 
-/* seno/coseno de "ang" en 1/256 de vuelta (0 = las 12, horario) */
-static int sen256(unsigned a)
+/* seno/coseno de "ang" en 1/256 de vuelta (0 = las 12, horario).
+   Lookup directo; a se enmascara a 8 bits. */
+static __inline int sen256(unsigned a)
 {
-    unsigned q = (a >> 6) & 3u;
-    unsigned i = a & 63u;
-    if (q == 0u) return  SEN[i];
-    if (q == 1u) return  SEN[64u - i];
-    if (q == 2u) return -SEN[i];
-    return -SEN[64u - i];
+    return SIN256[a & 255u];
 }
 
-#define cos256(a) sen256(64u - (a))
+static __inline int cos256(unsigned a)
+{
+    return COS256[a & 255u];
+}
 
 /* punto del dial: s y c son seno y coseno (Q8) del angulo de la aguja,
    rr va a lo largo de la aguja (negativo = cola) y k es perpendicular.
@@ -534,11 +573,19 @@ static int tecla(unsigned char *ascii)
     return 1;
 }
 
-/* espera al principio del retrazo vertical (puerto 3DAh, bit 3) */
+/* espera al principio del retrazo vertical (puerto 3DAh, bit 3).
+   Timeout ~2 tics BIOS por si el bit no cambia (emulador/tarjeta rara). */
 static void espera_retrazo(void)
 {
-    while ((inp(0x3DA) & 0x08) != 0) ;
-    while ((inp(0x3DA) & 0x08) == 0) ;
+    unsigned short far *t = (unsigned short far *)MK_FP(0x40, 0x6C);
+    unsigned short t0 = t[0];
+    while ((inp(0x3DA) & 0x08) != 0) {
+        if ((unsigned short)(t[0] - t0) > 2u) return;
+    }
+    t0 = t[0];
+    while ((inp(0x3DA) & 0x08) == 0) {
+        if ((unsigned short)(t[0] - t0) > 2u) return;
+    }
 }
 
 /* dia del mes del DOS (int 21h AH=2Ah; el DOS ya lo lee del RTC al
@@ -896,22 +943,45 @@ static void volcar(void)
    minutero (<= 6144) ya cabe en 16 bits: solo quedan dos divisiones
    largas para los angulos, la ultima de 16 bits.  Los productos van
    con desplazamientos.  Solo se llama cuando cambia el tic. */
+/* Fraccion del tic actual leyendo el canal 0 del PIT (sin tocar IRQ0).
+   0 = justo tras el IRQ0, ~65535 = justo antes del siguiente. */
+static unsigned pit_frac(void)
+{
+    unsigned lo, hi, c;
+    outp(0x43, 0x00);           /* latch canal 0 */
+    lo = (unsigned)inp(0x40);
+    hi = (unsigned)inp(0x40);
+    c = (hi << 8) | lo;
+    return (unsigned)(0xFFFFu - c);
+}
+
 static void angulos(unsigned long tk, unsigned *a_h, unsigned *a_m,
                     unsigned *a_s, unsigned *pulso)
 {
     /* tk * 2000 = 1024+512+256+128+64+16 veces tk */
     unsigned long t2k = (tk << 10) + (tk << 9) + (tk << 8)
                       + (tk << 7) + (tk << 6) + (tk << 4);
-    unsigned long seg = t2k / 36413UL;                     /* s desde las 0h */
-    unsigned long t256 = (seg << 8)
-                       + (((t2k - seg * 36413UL) << 8) / 36413UL);
-    unsigned long vs = t256 / 60UL;      /* vueltas del segundero, sin recortar */
-    unsigned long vm = vs / 60UL;        /* idem minutero: cabe en unsigned */
+    unsigned long seg = t2k / 36413UL;
+    unsigned long sub = ((t2k - seg * 36413UL) << 8) / 36413UL;
+    /* Sub-tick del PIT: reparte ~14 unidades de 1/256 s dentro del tic */
+    {
+        unsigned pf = pit_frac();
+        sub += ((unsigned long)pf * 14UL) >> 16;
+        if (sub > 255UL) {
+            sub -= 256UL;
+            seg++;
+        }
+    }
+    {
+        unsigned long t256 = (seg << 8) + sub;
+        unsigned long vs = t256 / 60UL;
+        unsigned long vm = vs / 60UL;
 
-    *a_s = (unsigned)vs & 255u;
-    *a_m = (unsigned)vm & 255u;
-    *a_h = ((unsigned)vm / 12u) & 255u;
-    *pulso = (unsigned)(t256 >> 6) & 255u;
+        *a_s = (unsigned)vs & 255u;
+        *a_m = (unsigned)vm & 255u;
+        *a_h = ((unsigned)vm / 12u) & 255u;
+        *pulso = (unsigned)(t256 >> 6) & 255u;
+    }
 }
 
 int main(void)
@@ -930,6 +1000,7 @@ int main(void)
         return 1;
     }
 
+    init_sincos();
     modo_video(0x13);
     montar();
     pinta_fecha(lee_fecha());
@@ -950,7 +1021,7 @@ int main(void)
                 if (opl) opl_silencio(); else callar();  /* que no quede sonido */
                 modo_video(0x03);
                 /* \x82 = e con acento en CP437/CP850 (el fuente va en UTF-8) */
-                banner(" ROLEX.COM v6 (c) Copyright 2026 by Javier Guti\x82rrez Chamorro (Guti)");
+                banner(" ROLEX.COM v7 (c) Copyright 2026 by Javier Guti\x82rrez Chamorro (Guti)");
                 return 0;
             }
             /* cualquier otra tecla se descarta del buffer */
@@ -964,14 +1035,19 @@ int main(void)
         }
         tk_ant = tk;
         angulos(tk, &a_h, &a_m, &a_s, &pul);
-        if (sonando) {                         /* altavoz: apaga el tic anterior */
+        /* altavoz: apaga tras >=1 tic BIOS desde el encendido (~55 ms) */
+        if (sonando && (tk - (unsigned long)sonando) >= 1UL) {
             callar();
             sonando = 0;
         }
         if (pul != p_pul) {                    /* nuevo cuarto de segundo */
             p_pul = pul;
             if (opl) tic_tac(pul);             /* FM: click con caida propia */
-            else { pitido(pul); sonando = 1; } /* altavoz: ~55 ms de tono */
+            else {
+                pitido(pul);
+                sonando = (int)tk;
+                if (sonando == 0) sonando = 1; /* tk==0 en arranque */
+            }
         }
         if (a_h == p_h && a_m == p_m && a_s == p_s) continue;  /* igual */
         p_h = a_h; p_m = a_m; p_s = a_s;

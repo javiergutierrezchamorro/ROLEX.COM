@@ -943,18 +943,6 @@ static void volcar(void)
    minutero (<= 6144) ya cabe en 16 bits: solo quedan dos divisiones
    largas para los angulos, la ultima de 16 bits.  Los productos van
    con desplazamientos.  Solo se llama cuando cambia el tic. */
-/* Fraccion del tic actual leyendo el canal 0 del PIT (sin tocar IRQ0).
-   0 = justo tras el IRQ0, ~65535 = justo antes del siguiente. */
-static unsigned pit_frac(void)
-{
-    unsigned lo, hi, c;
-    outp(0x43, 0x00);           /* latch canal 0 */
-    lo = (unsigned)inp(0x40);
-    hi = (unsigned)inp(0x40);
-    c = (hi << 8) | lo;
-    return (unsigned)(0xFFFFu - c);
-}
-
 static void angulos(unsigned long tk, unsigned *a_h, unsigned *a_m,
                     unsigned *a_s, unsigned *pulso)
 {
@@ -963,15 +951,9 @@ static void angulos(unsigned long tk, unsigned *a_h, unsigned *a_m,
                       + (tk << 7) + (tk << 6) + (tk << 4);
     unsigned long seg = t2k / 36413UL;
     unsigned long sub = ((t2k - seg * 36413UL) << 8) / 36413UL;
-    /* Sub-tick del PIT: reparte ~14 unidades de 1/256 s dentro del tic */
-    {
-        unsigned pf = pit_frac();
-        sub += ((unsigned long)pf * 14UL) >> 16;
-        if (sub > 255UL) {
-            sub -= 256UL;
-            seg++;
-        }
-    }
+    /* Nota: sin sub-tick del PIT.  El BIOS programa el canal 0 en modo 3
+       (cuadrada), de modo que la lectura del contador no aporta fraccion
+       util del tic; el redondeo de 1/256 s ya es finer que el ojo. */
     {
         unsigned long t256 = (seg << 8) + sub;
         unsigned long vs = t256 / 60UL;
@@ -1035,8 +1017,8 @@ int main(void)
         }
         tk_ant = tk;
         angulos(tk, &a_h, &a_m, &a_s, &pul);
-        /* altavoz: apaga tras >=1 tic BIOS desde el encendido (~55 ms) */
-        if (sonando && (tk - (unsigned long)sonando) >= 1UL) {
+        /* altavoz: apaga en el tic siguiente al encendido (~55 ms) */
+        if (sonando) {
             callar();
             sonando = 0;
         }
@@ -1045,8 +1027,7 @@ int main(void)
             if (opl) tic_tac(pul);             /* FM: click con caida propia */
             else {
                 pitido(pul);
-                sonando = (int)tk;
-                if (sonando == 0) sonando = 1; /* tk==0 en arranque */
+                sonando = 1;
             }
         }
         if (a_h == p_h && a_m == p_m && a_s == p_s) continue;  /* igual */

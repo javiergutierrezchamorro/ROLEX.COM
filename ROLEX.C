@@ -259,11 +259,15 @@ static int *cmax = suc_max[0];
    por eso los ordena antes de llamar.  Con los extremos cruzados la
    franja queda "vacia" (min > max) y esos pixeles ni se borran del
    marco ni se vuelcan a la VRAM: la aguja deja rastro. */
-/* margen 1 px: evita rastro residual en diagonales del Bresenham */
+/* margen 1 px: evita rastro residual en diagonales del Bresenham.
+   Se acota al dial para que los _fmemcpy alineados de compone/volcar
+   nunca vean x negativos ni fuera de [0, DIAL_W-1]. */
 static __inline void sucia(int x1, int x2, int y)
 {
     if (x1 > 0) x1--;
     if (x2 < DIAL_W - 1) x2++;
+    if (x1 < 0) x1 = 0;
+    if (x2 > DIAL_W - 1) x2 = DIAL_W - 1;
     if (x1 < cmin[y]) cmin[y] = x1;
     if (x2 > cmax[y]) cmax[y] = x2;
 }
@@ -488,11 +492,12 @@ static void centro(void)
 
 /* ==================== fecha cocinada en la esfera ==================== */
 
-/* un digito 5x7 dentro de la ventanita, directo en la esfera limpia
-   (sin recorte ni franjas: pinta_fecha marca toda la esfera sucia) */
-static void digito(int x, int y, char ch)
+/* un digito 5x7 (v = 0..9) dentro de la ventanita, directo en la
+   esfera limpia (sin recorte ni franjas: pinta_fecha marca toda la
+   esfera sucia) */
+static void digito(int x, int y, int v)
 {
-    const unsigned char *g = FUENTE[ch - '0'];
+    const unsigned char *g = FUENTE[v];
     unsigned char far *d = ESFERA + OFF170(y) + (unsigned)x;
     unsigned char m;
     int f, b;
@@ -523,13 +528,11 @@ static void pinta_fecha(int dia)
         off += DIAL_W;
     }
     if (dia < 10) {                     /* un digito, centrado */
-        digito(VEN_X0 + ((VEN_ANCHO - DIG_W) >> 1), yd, (char)('0' + dia));
+        digito(VEN_X0 + ((VEN_ANCHO - DIG_W) >> 1), yd, dia);
     } else {
         int x0 = VEN_X0 + ((VEN_ANCHO - (2 * DIG_W + 1)) >> 1);
-        int dec = 0;
-        while (dia >= 10) { dia -= 10; dec++; }   /* dia / 10 y dia % 10 */
-        digito(x0,             yd, (char)('0' + dec));
-        digito(x0 + DIG_W + 1, yd, (char)('0' + dia));
+        digito(x0,             yd, dia / 10);
+        digito(x0 + DIG_W + 1, yd, dia % 10);
     }
     sucio_todo();
 }
@@ -998,7 +1001,9 @@ int main(void)
     tk_ant = lee_ticks() - 1;            /* != tk: el primer fotograma sale ya */
 
     for (;;) {
-        while (tecla(&t)) {
+        tk = lee_ticks();
+        if (tk == tk_ant) continue;            /* mismo tic: nada que hacer */
+        while (tecla(&t)) {                    /* teclado solo al cambiar el tic */
             if (t == 27) {                     /* ESC -> salir */
                 if (opl) opl_silencio(); else callar();  /* que no quede sonido */
                 modo_video(0x03);
@@ -1008,8 +1013,6 @@ int main(void)
             }
             /* cualquier otra tecla se descarta del buffer */
         }
-        tk = lee_ticks();
-        if (tk == tk_ant) continue;            /* mismo tic: nada que hacer */
         if (tk < tk_ant) {                     /* cruzo la medianoche */
             pinta_fecha(lee_fecha());
             p_h = 0xFFFFu;  /* fecha nueva: redibuja ya aunque las agujas

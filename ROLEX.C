@@ -47,7 +47,9 @@
  *     decodifica por tiras y la ventana de la fecha se borra por filas.
  *
  * Mejoras v7 (C puro, sin ASM ni pragma aux):
- *   - Tablas SIN256/COS256 de 256 entradas: lookup O(1) sin ramas.
+ *   - Tabla SIN256 de 256+64 entradas: el seno es SIN256[a] y el coseno
+ *     SIN256[a+64] (cos a = sen(a + 90 deg)), sin segunda tabla ni
+ *     mascaras en el camino caliente.  Una sola init por simetria.
  *   - Fraccion de tic leyendo el contador del PIT canal 0 (latch) sin
  *     reprogramar IRQ0: segundero sub-tick y hora del DOS intacta.
  *   - Franjas sucias con margen de 1 px (menos rastros en diagonales).
@@ -140,8 +142,8 @@
 #define OFF320(y) (((unsigned)(y) << 8) + ((unsigned)(y) << 6))
 
 /* offsets de fila de la esfera (y * 170) SIN multiplicar ni desplazar:
-   tabla de DIAL_H palabras que rellena montar() por sumas.  El maximo
-   es 169*170 = 28730: cabe en unsigned. */
+   tabla de DIAL_H palabras que rellena init_sincos() por sumas.  El
+   maximo es 169*170 = 28730: cabe en unsigned. */
 static unsigned fila170[DIAL_H];
 #define OFF170(y) (fila170[y])
 
@@ -176,7 +178,7 @@ static unsigned char far *ESFERA;  /* esfera limpia (base)         */
 /* ============================ datos ============================ */
 
 /* Tabla de seno Q8: SEN[k] = round(sin(k*2*pi/256)*256), k = 0..64;
-   el resto por simetria (sen256). */
+   el resto por simetria (init_sincos). */
 static const int SEN[65] = {
       0,    6,   13,   19,   25,   31,   38,   44,
      50,   56,   62,   68,   74,   80,   86,   92,
@@ -188,33 +190,45 @@ static const int SEN[65] = {
     251,  252,  253,  254,  255,  255,  256,  256,  256
 };
 
-/* Tablas completas de 256 angulos (1/256 de vuelta).  init_sincos() las
-   rellena UNA vez desde SEN[0..64] por simetria de cuadrantes. */
-static int SIN256[256];
-static int COS256[256];
+/* Tabla unica de 256 + 64 entradas: SIN256[a] es el seno y SIN256[a + 64]
+   el coseno (Q8) del angulo a, en 1/256 de vuelta (a < 256, sin mascaras
+   en el camino caliente: el +64 nunca sale de la tabla).  Una sola init
+   por simetria de cuadrantes, y los 64 ultimos son copia de los 64
+   primeros para que cos a = sen(a + 64) se resuelva con un acceso.
+   Tiene 320 entradas (640 bytes) en vez de dos tablas de 256 (1024). */
+static int SIN256[256 + 64];
 
+/* seno/coseno de "ang" en 1/256 de vuelta (0 = las 12, horario).
+   Lookup directo; a se enmascara a 8 bits.  coseno = seno desplazado
+   64 (cos a = sen(a + 90 deg)), una sola tabla. */
+static __inline int sen256(unsigned a)
+{
+    return SIN256[a & 255u];
+}
+
+static __inline int cos256(unsigned a)
+{
+    return SIN256[(a & 255u) + 64u];
+}
+
+/* rellena SIN256 (por simetria de cuadrantes desde SEN[0..64]) y
+   fila170 (offsets de fila por sumas): UNA sola init al arrancar */
 static void init_sincos(void)
 {
-    unsigned a;
-    for (a = 0; a < 256u; a++) {
-        unsigned q = (a >> 6) & 3u;
-        unsigned i = a & 63u;
-        int s;
-        if (q == 0u)      s =  SEN[i];
-        else if (q == 1u) s =  SEN[64u - i];
-        else if (q == 2u) s = -SEN[i];
-        else              s = -SEN[64u - i];
-        SIN256[a] = s;
-        {
-            unsigned ca = (64u - a) & 255u;
-            unsigned cq = (ca >> 6) & 3u;
-            unsigned ci = ca & 63u;
-            if (cq == 0u)      COS256[a] =  SEN[ci];
-            else if (cq == 1u) COS256[a] =  SEN[64u - ci];
-            else if (cq == 2u) COS256[a] = -SEN[ci];
-            else               COS256[a] = -SEN[64u - ci];
-        }
+    int k;
+    unsigned o = 0;
+
+    for (k = 0; k <= 64; k++) {          /* el resto, por simetria */
+        SIN256[k]       =  SEN[k];
+        SIN256[128 - k] =  SEN[k];
+        SIN256[128 + k] = -SEN[k];
+        SIN256[256 - k] = -SEN[k];
     }
+    for (k = 256; k < 256 + 64; k++)     /* cos(a) = sen(a + 64) */
+        SIN256[k] = SIN256[k - 256];
+
+    for (k = 0; k < DIAL_H; k++, o += DIAL_W)   /* fila170[k] = k * 170 */
+        fila170[k] = o;
 }
 
 /* Digitos 5x7 para la fecha.  Bit 0x80 = pixel izquierdo (solo se usan
@@ -372,18 +386,6 @@ static void disco(int cx, int cy, int r, unsigned char c)
             linea_h(cx - h, cx + h, cy - dy, c);
         dy2 += (dy << 1) + 1;
     }
-}
-
-/* seno/coseno de "ang" en 1/256 de vuelta (0 = las 12, horario).
-   Lookup directo; a se enmascara a 8 bits. */
-static __inline int sen256(unsigned a)
-{
-    return SIN256[a & 255u];
-}
-
-static __inline int cos256(unsigned a)
-{
-    return COS256[a & 255u];
 }
 
 /* punto del dial: s y c son seno y coseno (Q8) del angulo de la aguja,
@@ -840,21 +842,15 @@ static void decodificar_fondo(void)
     }
 }
 
-/* Monta la escena una sola vez al arrancar: tabla de offsets de fila,
-   paleta al DAC, pantalla a negro, franja central descomprimida a su
-   sitio y esfera limpia recortada al bloque de RAM (detras del marco
-   de trabajo).  El offset de la VRAM avanza por suma (320 por fila),
-   sin multiplicar. */
+/* Monta la escena una sola vez al arrancar: paleta al DAC, pantalla a
+   negro, franja central descomprimida a su sitio y esfera limpia
+   recortada al bloque de RAM (detras del marco de trabajo).  El
+   offset de la VRAM avanza por suma (320 por fila), sin multiplicar.
+   fila170[] ya la relleno init_sincos(). */
 static void montar(void)
 {
     unsigned off = OFF320(DIAL_Y) + (unsigned)DIAL_X;   /* 15*320+76 */
-    unsigned o = 0;
     int f, i;
-
-    for (f = 0; f < DIAL_H; f++) {        /* fila170[f] = f * 170, por sumas */
-        fila170[f] = o;
-        o += DIAL_W;
-    }
 
     outp(0x3C8, 0);
     for (i = 0; i < 768; i++)
@@ -1040,4 +1036,3 @@ int main(void)
         volcar();
     }
 }
-

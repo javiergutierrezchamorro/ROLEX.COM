@@ -46,12 +46,21 @@
  *   - Bloques con memset/memcpy siempre que se puede: el fondo RLE se
  *     decodifica por tiras y la ventana de la fecha se borra por filas.
  *
+ * LUPA de la fecha (el "cyclops" de la ventanita de las 3h), igual que en
+ * ROLEX386.C a mitad de escala: lente de 18x12 que AUMENTA 5/2 una fuente de
+ * 15x10 (la resolucion de ROLEX386, 2 pixeles por pixel del dial) con los
+ * digitos 5x7 a escala 1; esa imagen ampliada se cocina en la esfera limpia
+ * y solo se recompone, con las agujas ensanchadas 5/2, cuando el minutero o
+ * el segundero pasan bajo el cristal.  El cristal de la foto (ROLEX.H, sacado
+ * de ROLEX386.H) queda debajo, fuera de la lente.
+ *
  * Mejoras v7 (C puro, sin ASM ni pragma aux):
  *   - Tabla SIN256 de 256+64 entradas: el seno es SIN256[a] y el coseno
  *     SIN256[a+64] (cos a = sen(a + 90 deg)), sin segunda tabla ni
  *     mascaras en el camino caliente.  Una sola init por simetria.
- *   - Fraccion de tic leyendo el contador del PIT canal 0 (latch) sin
- *     reprogramar IRQ0: segundero sub-tick y hora del DOS intacta.
+ *   - Fraccion de tic por el RESTO del tic del BIOS (sin reprogramar
+ *     IRQ0 ni leer el PIT, que en modo 3 no aporta fraccion util):
+ *     segundero sub-tick (barrido suave) y hora del DOS intacta.
  *   - Franjas sucias con margen de 1 px (menos rastros en diagonales).
  *   - Speaker apagado por delta de tics (no solo "siguiente tic").
  *   - espera_retrazo con timeout por tics BIOS (no cuelga si 3DAh falla).
@@ -163,9 +172,52 @@ static unsigned fila170[DIAL_H];
 #error La ventanita de la fecha no cabe para dos digitos
 #endif
 
+/* LUPA de la fecha (cyclops): lente LUP_W x LUP_H que AUMENTA 5/2 sobre
+   la ventanita (escala /2 de ROLEX386: 36x25 -> 18x12).  LUP_SW x LUP_SH
+   es lo que ve la lente (la FUENTE) y va a la resolucion de ROLEX386, el
+   doble de la del dial: asi los digitos 5x7 de la fecha salen con el mismo
+   tamano relativo que en ROLEX386 (en el dial, 5/2 de un pixel de fuente
+   son 5/4 de pixel).  LUP_R* es el aro de cristal, un pixel por fuera de
+   la lente.  LUP_SX0 / LUP_SY0 es la columna / fila del dial bajo el
+   primer pixel de la fuente (cada pixel del dial son 2 de la fuente). */
+#define LUP_W    18
+#define LUP_H    12
+#define LUP_X0   (VEN_X0 + (VEN_ANCHO - LUP_W) / 2)
+#define LUP_Y0   (VEN_Y0 + (VEN_ALTO - LUP_H) / 2)
+#define LUP_RX0  (LUP_X0 - 1)
+#define LUP_RY0  (LUP_Y0 - 1)
+#define LUP_RW   (LUP_W + 2)
+#define LUP_RH   (LUP_H + 2)
+#define LUP_RX1  (LUP_RX0 + LUP_RW - 1)
+#define LUP_RY1  (LUP_RY0 + LUP_RH - 1)
+#define LUP_SW   15
+#define LUP_SH   10
+#define LUP_SX0  (LUP_X0 + (LUP_W - (LUP_SW + 1) / 2) / 2)
+#define LUP_SY0  (LUP_Y0 + (LUP_H - (LUP_SH + 1) / 2) / 2)
+#define LUP_M    12          /* alcance de una aguja ampliada fuera de la lente */
+#define FEC_X1   ((LUP_SW - DIG_W + 1) / 2)               /* un digito   */
+#define FEC_X2   ((LUP_SW - (2 * DIG_W + 1) + 1) / 2)     /* dos digitos */
+#define FEC_Y    ((LUP_SH - DIG_ALTO + 1) / 2)
+#define C_ARO1   184         /* aro de la lupa: arriba e izquierda (DAC 46) */
+#define C_ARO2   136         /* aro de la lupa: abajo y derecha (DAC 34)    */
+#if (LUP_RX0 < 0) || (LUP_RX1 >= DIAL_W) || (LUP_RY0 < 0) || (LUP_RY1 >= DIAL_H)
+#error La lupa de la fecha no cabe en el dial
+#endif
+#if (LUP_W < VEN_ANCHO + 4) || (LUP_H < VEN_ALTO + 4)
+#error La lupa no tapa la ventanita de la fecha
+#endif
+#if ((4 * (LUP_W - 1) + 2) / 5 >= LUP_SW) || ((4 * (LUP_H - 1) + 2) / 5 >= LUP_SH)
+#error LUP_SW x LUP_SH no cubre lo que ve la lente (aumento 5/2 de la fuente)
+#endif
+#if (LUP_SW < 2 * DIG_W + 1) || (LUP_SH < DIG_ALTO)
+#error La fuente de la lupa no cabe para dos digitos
+#endif
+
 /* buferes de trabajo en RAM convencional; los fija reservar() */
 static unsigned char far *MARCO;   /* fotograma compuesto          */
 static unsigned char far *ESFERA;  /* esfera limpia (base)         */
+static unsigned char far *STRIP_BUF;  /* franja RLE en RAM (solo montaje) */
+#define STRIP_H   200                  /* alto de la franja (mode 13h)    */
 
 /* indices fijos de la paleta (0..249 es la rampa de grises de la foto;
    250..255 los fija prep_img.py para lo que dibuja este programa) */
@@ -231,9 +283,9 @@ static void init_sincos(void)
         fila170[k] = o;
 }
 
-/* Digitos 5x7 para la fecha.  Bit 0x80 = pixel izquierdo (solo se usan
-   los 5 bits altos).  Con 7 de ancho no cabia el pixel de separacion
-   entre los dos digitos en una ventanita de 14: se pegaban. */
+/* Digitos 5x7 para la fecha, a escala 1 en la fuente de la lente (como en
+   ROLEX386: la lente los agranda).  Bit 0x80 = pixel izquierdo (solo se
+   usan los 5 bits altos). */
 static const unsigned char FUENTE[10][DIG_ALTO] = {
     { 0x70, 0x88, 0x98, 0xA8, 0xC8, 0x88, 0x70 },  /* 0 */
     { 0x20, 0x60, 0x20, 0x20, 0x20, 0x20, 0x70 },  /* 1 */
@@ -297,13 +349,19 @@ static void sucio_todo(void)
     }
 }
 
+/* rectangulo de recorte para el dibujo (por defecto, todo el dial).  La
+   lupa lo estrecha a la lente al pintar las agujas ampliadas, y lo repone
+   al salir: linea_h/poligono recortan sin tocar baston(). */
+static int clip_x0 = 0, clip_x1 = DIAL_W - 1;
+static int clip_y0 = 0, clip_y1 = DIAL_H - 1;
+
 static void linea_h(int x1, int x2, int y, unsigned char c)
 {
     int t;
-    if (y < 0 || y >= DIAL_H) return;
+    if (y < clip_y0 || y > clip_y1) return;
     if (x1 > x2) { t = x1; x1 = x2; x2 = t; }
-    if (x1 < 0) x1 = 0;
-    if (x2 >= DIAL_W) x2 = DIAL_W - 1;
+    if (x1 < clip_x0) x1 = clip_x0;
+    if (x2 > clip_x1) x2 = clip_x1;
     if (x1 > x2) return;
     sucia(x1, x2, y);
     /* bloque horizontal: memset en vez de bucle de pixeles */
@@ -439,7 +497,8 @@ static void linea(int x0, int y0, int x1, int y1, unsigned char c)
 }
 
 /* proporciones de la aguja con sumas de desplazamientos (valores
-   TRUNCADOS, hw de 1 a 5, los que usa baston2):
+   TRUNCADOS, hw de 1 a 7: los de baston2 y los de las agujas ampliadas
+   de la lupa):
      hwt   = 0.60 * hw  (77/128)     hwtip = 0.55 * hw  (141/256) */
 #define HWT(hw)   ((((hw) << 6) + ((hw) << 3) + ((hw) << 2) + (hw)) >> 7)
 #define HWTIP(hw) ((((hw) << 7) + ((hw) << 3) + ((hw) << 2) + (hw)) >> 8)
@@ -492,51 +551,148 @@ static void centro(void)
     disco(DCX, DCY, CEN_PN, C_OSC);
 }
 
-/* ==================== fecha cocinada en la esfera ==================== */
+/* ==================== lupa y fecha cocinadas en la esfera ==================== */
 
-/* un digito 5x7 (v = 0..9) dentro de la ventanita, directo en la
-   esfera limpia (sin recorte ni franjas: pinta_fecha marca toda la
-   esfera sucia) */
-static void digito(int x, int y, int v)
+/* La fuente de la lente es el trozo LUP_SW x LUP_SH que hay bajo ella, a la
+   resolucion de ROLEX386 (2 pixeles de fuente por pixel del dial).  lup_foto
+   guarda el fondo (sin fecha) y lup_fuente le suma la fecha del dia.  lup_cx
+   / lup_cy dicen de que columna / fila de la fuente sale cada columna / fila
+   de la lente (lup_cy ya multiplicado por LUP_SW): el aumento 5/2 de la
+   fuente hace que cada pixel de la fuente salga 1 o 2 veces en el dial, y con
+   las tablas cada pixel de la lente es UN acceso. */
+static unsigned char lup_foto[LUP_SW * LUP_SH];
+static unsigned char lup_fuente[LUP_SW * LUP_SH];
+static unsigned char lup_cx[LUP_W];
+static unsigned char lup_cy[LUP_H];
+
+/* destino i -> fuente (4i+2)/5: el centro del pixel de la lente (2i+1 en la
+   resolucion de ROLEX386) por 2/5; el numerador va de 4 en 4 y se lleva el
+   cociente por sumas, sin dividir */
+static void init_lupa(void)
 {
-    const unsigned char *g = FUENTE[v];
-    unsigned char far *d = ESFERA + OFF170(y) + (unsigned)x;
-    unsigned char m;
-    int f, b;
-    for (f = 0; f < DIG_ALTO; f++) {
-        unsigned char bits = g[f];
-        for (b = 0, m = 0x80; b < DIG_W; b++, m >>= 1)
-            if (bits & m)
-                d[b] = C_NEG;
-        d += DIAL_W;
+    int i, q = 0, r = 2;
+    unsigned o = 0;
+
+    for (i = 0; i < LUP_W; i++) {
+        lup_cx[i] = (unsigned char)q;
+        r += 4;
+        if (r >= 5) { r -= 5; q++; }
+    }
+    for (i = 0, r = 2; i < LUP_H; i++) {
+        lup_cy[i] = (unsigned char)o;
+        r += 4;
+        if (r >= 5) { r -= 5; o += LUP_SW; }
     }
 }
 
-/* dia del mes en la ventanita de las 3 (sin cero inicial: el dia 8 se
-   escribe "8", no "08"), centrado en la abertura de IMGRLE.H.  Se
-   cocina UNA VEZ sobre la esfera limpia: el fotograma de cada frame
-   la copia y asi no se repinta a 70 Hz.  El interior se borra por
-   filas de UNA vez (memset por bloque).  Que la ventanita quepa en la
-   esfera y los digitos en la ventanita lo comprueban los #if de
-   arriba. */
+/* pinta el interior de la lente en el dial (ESFERA o MARCO) agrandando la
+   fuente.  Las filas que repiten fila de la fuente (2 de cada 12) se copian
+   de la anterior. */
+static void lente(unsigned char far *dial, const unsigned char *fuente)
+{
+    unsigned char far *d = dial + OFF170(LUP_Y0) + (unsigned)LUP_X0;
+    const unsigned char *s;
+    int i, j;
+
+    for (j = 0; j < LUP_H; j++, d += DIAL_W) {
+        if (j != 0 && lup_cy[j] == lup_cy[j - 1]) {
+            _fmemcpy(d, d - DIAL_W, LUP_W);
+            continue;
+        }
+        s = fuente + lup_cy[j];
+        for (i = 0; i < LUP_W; i++)
+            d[i] = s[lup_cx[i]];
+    }
+}
+
+/* aro del cristal, un pixel por fuera de la lente (sin las esquinas, que
+   quedan redondeadas): claro arriba y a la izquierda, oscuro abajo y a la
+   derecha */
+static void aro(unsigned char far *dial)
+{
+    unsigned char far *d = dial + OFF170(LUP_RY0) + (unsigned)LUP_RX0;
+    int j;
+
+    _fmemset(d + 1, C_ARO1, LUP_RW - 2);
+    for (j = 1, d += DIAL_W; j < LUP_RH - 1; j++, d += DIAL_W) {
+        d[0] = C_ARO1;
+        d[LUP_RW - 1] = C_ARO2;
+    }
+    _fmemset(d + 1, C_ARO2, LUP_RW - 2);
+}
+
+/* un digito 5x7 a escala 1 en la fuente de la lente (la lente lo agranda) */
+static void digito(int x, int y, int v)
+{
+    const unsigned char *g = FUENTE[v];
+    unsigned char *d = lup_fuente + y * LUP_SW + x;
+    unsigned char m;
+    int f, b;
+
+    for (f = 0; f < DIG_ALTO; f++, d += LUP_SW)
+        for (b = 0, m = 0x80; b < DIG_W; b++, m >>= 1)
+            if (g[f] & m) d[b] = C_NEG;
+}
+
+/* dia del mes (sin cero inicial) bajo la lupa, centrado.  Se cocina UNA
+   VEZ sobre la esfera limpia y a medianoche se vuelve a cocinar con el dia
+   nuevo.  La lente agranda la fuente 5/2 y el aro cierra el cristal. */
 static void pinta_fecha(int dia)
 {
-    unsigned off = OFF170(VEN_Y0) + (unsigned)VEN_X0;
-    int yd = VEN_Y0 + ((VEN_ALTO - DIG_ALTO) >> 1);
-    int y;
-
-    for (y = 0; y < VEN_ALTO; y++) {
-        _fmemset(ESFERA + off, C_BLA, (unsigned)VEN_ANCHO);
-        off += DIAL_W;
-    }
+    memcpy(lup_fuente, lup_foto, sizeof(lup_fuente));
     if (dia < 10) {                     /* un digito, centrado */
-        digito(VEN_X0 + ((VEN_ANCHO - DIG_W) >> 1), yd, dia);
+        digito(FEC_X1, FEC_Y, dia);
     } else {
-        int x0 = VEN_X0 + ((VEN_ANCHO - (2 * DIG_W + 1)) >> 1);
-        digito(x0,             yd, dia / 10);
-        digito(x0 + DIG_W + 1, yd, dia % 10);
+        digito(FEC_X2,             FEC_Y, dia / 10);
+        digito(FEC_X2 + DIG_W + 1, FEC_Y, dia % 10);
     }
+    lente(ESFERA, lup_fuente);
+    aro(ESFERA);
     sucio_todo();
+}
+
+/* ==================== lupa: agujas bajo la lente ==================== */
+
+/* Puede alguna aguja del fotograma recien pintado verse bajo la lente?
+   Las franjas sucias lo dicen sin mirar un solo pixel (con margen: bajo el
+   cristal la aguja se ve mas ancha que fuera) */
+static int lupa_toca(void)
+{
+    int y, y0 = LUP_RY0 - LUP_M, y1 = LUP_RY1 + LUP_M;
+
+    if (y0 < 0) y0 = 0;
+    if (y1 > DIAL_H - 1) y1 = DIAL_H - 1;
+    for (y = y0; y <= y1; y++)
+        if (cmax[y] >= LUP_RX0 - LUP_M && cmin[y] <= LUP_RX1 + LUP_M)
+            return 1;
+    return 0;
+}
+
+/* recompone la lente con las agujas: se devuelve a su sitio todo el
+   rectangulo (fecha ampliada y aro) desde la esfera, lo que borra las
+   agujas pintadas SIN aumento encima de la lente, y encima de la fecha se
+   vuelven a pintar el minutero y el segundero AMPLIADOS 5/2 en anchura (la
+   misma aguja, con el semiancho por 5/2 y recortada al interior de la
+   lente, de modo que su eje sigue en linea con la aguja de fuera).
+   El horario no llega nunca a la lupa. */
+static void lupa(unsigned a_m, unsigned a_s)
+{
+    unsigned char far *m = MARCO + OFF170(LUP_RY0) + (unsigned)LUP_RX0;
+    unsigned char far *e = ESFERA + OFF170(LUP_RY0) + (unsigned)LUP_RX0;
+    int y, s = sen256(a_m), c = cos256(a_m);
+
+    for (y = LUP_RY0; y <= LUP_RY1; y++, m += DIAL_W, e += DIAL_W) {
+        _fmemcpy(m, e, LUP_RW);
+        sucia(LUP_RX0, LUP_RX1, y);
+    }
+    clip_x0 = LUP_X0;  clip_x1 = LUP_X0 + LUP_W - 1;
+    clip_y0 = LUP_Y0;  clip_y1 = LUP_Y0 + LUP_H - 1;
+    baston(s, c, R_AG_M,         COL_M,         (HW_M * 5) >> 1,         C_OSC);
+    if (HW_M >= 2) baston(s, c, R_AG_M - 1, COL_M - 1, ((HW_M - 1) * 5) >> 1, C_HI);
+    if (HW_M >= 3) baston(s, c, R_AG_M - 2, COL_M - 2, ((HW_M - 2) * 5) >> 1, C_CLA);
+    baston(sen256(a_s), cos256(a_s), R_AG_S, COL_S, 2, C_OSC);
+    clip_x0 = 0;  clip_x1 = DIAL_W - 1;
+    clip_y0 = 0;  clip_y1 = DIAL_H - 1;
 }
 
 /* ============================ hardware ============================ */
@@ -790,55 +946,51 @@ static int reservar(void)
     }
     MARCO  = (unsigned char far *)MK_FP(r.x.ax, 0);
     ESFERA = (unsigned char far *)MK_FP(r.x.ax, DIAL_TAM);
+
+    /* bufer RAM para la franja RLE (49 KB): solo vive durante montar().
+       int 21h AH=48h pide ceil(STRIP_W*STRIP_H/16) parrafos. */
+    r.x.ax = 0x4800;
+    r.x.bx = (((unsigned)STRIP_W * STRIP_H + 15) >> 4);
+    int86(0x21, &r, &r);
+    if (r.x.cflag != 0) return 0;
+    STRIP_BUF = (unsigned char far *)MK_FP(r.x.ax, 0);
     return 1;
 }
 
 /* ==================== montaje de la imagen ==================== */
 
-/* Descompresion RLE directamente a la VRAM visible: una sola tira que
-   se escribe de izquierda a derecha por la franja central (STRIP_W
-   columnas desde STRIP_X).  Los pixeles son indices 0..249, de modo que
-   los bytes 250..255 sirven de marca de racha:
+/* Descompresion RLE a un bufer RAM contiguo (STRIP_BUF, 49 KB que pide
+   reservar()).  Los pixeles son indices 0..249, de modo que los bytes
+   250..255 sirven de marca de racha:
        b < 250      un pixel suelto
        b = 251..255 racha de b-248 (3..7) pixeles del byte siguiente
        b = 250      racha larga: byte de cuenta (8..255) y byte valor
-   Nueve de cada diez rachas de la imagen son pixeles sueltos (los
-   degradados de la foto), asi que van por un camino corto, sin llamar
-   a memset.  Cada tira de una racha se escribe con UN memset (bloque)
-   y la fila avanza con un puntero, sin multiplicar. */
+   Al ir a RAM contiguo la franja (un tren lineal de pixeles) NO se parte
+   en los bordes de fila: el lazo queda sin logica de cruce de fila ni
+   comprobacion de fila por pixel.  montar() vuelca despues el bufer a la
+   VRAM con un _fmemcpy por fila y recorta la esfera del propio bufer, sin
+   releer la VRAM.  Nueve de cada diez rachas son pixeles sueltos (los
+   degradados de la foto), asi que van por un camino corto sin _fmemset;
+   cada racha se escribe con UN _fmemset (bloque). */
 static void decodificar_fondo(void)
 {
     const unsigned char *p   = FONDO_RLE;
     const unsigned char *fin = FONDO_RLE + FONDO_RLE_LEN;
-    unsigned char far *fila = (unsigned char far *)MK_FP(0xA000, STRIP_X);
-    unsigned x = 0;                       /* columna relativa 0..STRIP_W-1 */
+    unsigned char far *s    = STRIP_BUF;
+    unsigned char far *sfin = STRIP_BUF + (unsigned)STRIP_W * STRIP_H;
 
-    while (p < fin) {
+    while (p < fin && s < sfin) {
         unsigned char v = *p++;
         unsigned n;
-        if (v < 250) {                    /* pixel suelto */
-            fila[x] = v;
-            if (++x == (unsigned)STRIP_W) {
-                x = 0;
-                fila += 320u;             /* fila siguiente */
-            }
+        if (v < 250) {                    /* pixel suelto (caso comun) */
+            *s++ = v;
             continue;
         }
         n = (v == 250) ? (unsigned)*p++ : (unsigned)(v - 248);
         v = *p++;
-        while (n != 0u) {
-            unsigned cabe = (unsigned)STRIP_W - x;  /* px hasta fin de fila */
-            if (n < cabe) {
-                _fmemset(fila + x, v, n);
-                x += n;
-                n = 0;
-            } else {                     /* la racha cruza la fila */
-                _fmemset(fila + x, v, cabe);
-                x = 0;
-                fila += 320u;            /* fila siguiente */
-                n -= cabe;
-            }
-        }
+        if (s + n > sfin) n = (unsigned)(sfin - s);
+        _fmemset(s, v, n);
+        s += n;
     }
 }
 
@@ -849,7 +1001,9 @@ static void decodificar_fondo(void)
    fila170[] ya la relleno init_sincos(). */
 static void montar(void)
 {
-    unsigned off = OFF320(DIAL_Y) + (unsigned)DIAL_X;   /* 15*320+76 */
+    unsigned char far *s;
+    unsigned char far *v;
+    unsigned char far *e;
     int f, i;
 
     outp(0x3C8, 0);
@@ -857,13 +1011,45 @@ static void montar(void)
         outp(0x3C9, (unsigned char)(PALETA[i] >> 2));
 
     _fmemset((unsigned char far *)MK_FP(0xA000, 0), 0, 64000);
+
+    /* RLE -> bufer RAM contiguo (sin cruce de fila) */
     decodificar_fondo();
 
-    /* recorte de la esfera limpia: VRAM visible -> bloque de RAM */
-    for (f = 0; f < DIAL_H; f++) {
-        _fmemcpy(ESFERA + OFF170(f),
-                 (unsigned char far *)MK_FP(0xA000, off), DIAL_W);
-        off += 320u;
+    /* bufer RAM -> VRAM: una fila por _fmemcpy, avance por 320 (mode 13h) */
+    s = STRIP_BUF;
+    v = (unsigned char far *)MK_FP(0xA000, STRIP_X);
+    for (f = 0; f < STRIP_H; f++, v += 320u, s += STRIP_W)
+        _fmemcpy(v, s, STRIP_W);
+
+    /* esfera limpia (170x170): recorte del bufer RAM, no de la VRAM.
+       El dial cae en la franja en (DIAL_X-STRIP_X, DIAL_Y) = (32, 15). */
+    s = STRIP_BUF + (unsigned)DIAL_Y * STRIP_W + (unsigned)(DIAL_X - STRIP_X);
+    e = ESFERA;
+    for (f = 0; f < DIAL_H; f++, e += DIAL_W, s += STRIP_W)
+        _fmemcpy(e, s, DIAL_W);
+
+    /* lupa: tablas 5/2 + fondo bajo la lente (LUP_SW x LUP_SH, sin fecha).
+       pinta_fecha() —en main— hornea despues la fecha ampliada + el aro. */
+    init_lupa();
+    {
+        unsigned char far *ls = ESFERA + OFF170(LUP_SY0) + (unsigned)LUP_SX0;
+        int lf, lb;
+        for (lf = 0; lf < LUP_SH; lf++) {   /* 2 pixeles de fuente por pixel del dial */
+            const unsigned char far *fila = ls + OFF170((lf + 1) >> 1);
+            for (lb = 0; lb < LUP_SW; lb++)
+                lup_foto[(unsigned)lf * LUP_SW + lb] = fila[(lb + 1) >> 1];
+        }
+    }
+
+    /* libera el bufer de la franja: solo se usa en el montaje (49 KB).
+       int 21h AH=49h libera el bloque cuyo segmento va en ES. */
+    {
+        union REGS r;
+        struct SREGS sr;
+        segread(&sr);
+        sr.es = FP_SEG(STRIP_BUF);
+        r.x.ax = 0x4900;
+        int86x(0x21, &r, &r, &sr);
     }
 }
 
@@ -898,6 +1084,7 @@ static void compone(unsigned a_h, unsigned a_m, unsigned a_s)
     baston2(a_m, R_AG_M, COL_M, HW_M);
     segundero(a_s);
     centro();
+    if (lupa_toca()) lupa(a_m, a_s);   /* agujas ampliadas 5/2 bajo el cristal */
 }
 
 /* vuelca a la VRAM lo que cambia: por fila, la union de las franjas del
